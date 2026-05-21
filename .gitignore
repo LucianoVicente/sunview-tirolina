@@ -1,0 +1,36 @@
+# Entorno virtual
+.venv/
+
+# Vídeos y audio (grandes, no van al repo)
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+*.mkv
+*.MKV
+*.wav
+
+# Carpetas de trabajo (se crean automáticamente al ejecutar)
+entrada/
+salida/
+
+# Archivos temporales del script
+_audio_tmp.wav
+_check_inicio.wav
+_check_fin.wav
+
+# Cache de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Claude Code (configuración local del asistente)
+.claude/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
