@@ -10,9 +10,10 @@ import shutil
 from pathlib import Path
 
 # ========== CONFIGURACIÓN ==========
-CARPETA_ENTRADA = Path("entrada")
-CARPETA_SALIDA = Path("salida")
-LOGO_PATH = Path("assets/logo.png")
+_BASE = Path(__file__).parent          # siempre la carpeta del script
+CARPETA_ENTRADA = _BASE / "entrada"
+CARPETA_SALIDA  = _BASE / "salida"
+LOGO_PATH       = _BASE / "assets/logo.png"
 MODELO_WHISPER = "small"
 
 # Recorte
@@ -44,6 +45,9 @@ PALABRAS_FIN = [
     "perfecto",
     "apísima",
     "cómo estás", "como estás",
+    # Saludos de llegada
+    "hola",                 # muy común al llegar
+    "hala",                 # exclamación de llegada
     # Frases genéricas de bienvenida
     "bien bien bien", "bien, bien, bien",
     "qué tal", "que tal",
@@ -66,8 +70,6 @@ EXTENSIONES = (".mp4", ".mov", ".MP4", ".MOV", ".avi", ".AVI", ".mkv", ".MKV")
 
 # ========== MODO AUTOMÁTICO ==========
 MODO_AUTO = True        # True = sin preguntas, procesa todo solo
-VERIFICAR_BORDES = True # Re-transcribe los extremos del clip para confirmar el corte
-SEGUNDOS_BORDE = 8      # Segundos a analizar en cada extremo del clip editado
 
 
 # ========== UTILIDADES ==========
@@ -118,7 +120,7 @@ def transcribir_audio(audio_path, model):
         str(audio_path),
         language="es",
         verbose=False,
-        word_timestamps=True
+        temperature=0,
     )
     return result
 
@@ -228,12 +230,8 @@ def editar_video(video_entrada, inicio, fin, video_salida):
     subprocess.run(cmd, capture_output=True, check=True)
 
 
-def verificar_corte(video_salida, t_inicio_raw, t_fin_raw, model):
-    """
-    Comprueba que el clip editado tiene sentido: tamaño, duración y,
-    si VERIFICAR_BORDES, que la cuenta atrás y la llegada están presentes.
-    Devuelve (ok: bool, detalle: str).
-    """
+def verificar_corte(video_salida, t_inicio_raw, t_fin_raw):
+    """Comprueba tamaño y duración del clip. Devuelve (ok: bool, detalle: str)."""
     if not video_salida.exists():
         return False, "archivo de salida no encontrado"
 
@@ -247,53 +245,10 @@ def verificar_corte(video_salida, t_inicio_raw, t_fin_raw, model):
     if dur > 300:
         return False, f"clip demasiado largo ({dur:.0f}s)"
 
-    if t_inicio_raw is None:
-        return False, "inicio no fue detectado automáticamente — revisar manualmente"
-    if t_fin_raw is None:
-        return False, "fin no fue detectado automáticamente — revisar manualmente"
+    if t_inicio_raw is None or t_fin_raw is None:
+        return False, f"requiere ajuste manual ({dur:.0f}s)"
 
-    if not VERIFICAR_BORDES:
-        return True, f"OK ({dur:.0f}s, {size_mb:.1f} MB)"
-
-    audio_inicio = Path("_check_inicio.wav")
-    audio_fin = Path("_check_fin.wav")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_salida),
-            "-t", str(SEGUNDOS_BORDE),
-            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-            str(audio_inicio)
-        ], capture_output=True, check=True)
-
-        inicio_seg = max(0, dur - SEGUNDOS_BORDE)
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_salida),
-            "-ss", str(inicio_seg),
-            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-            str(audio_fin)
-        ], capture_output=True, check=True)
-
-        tx_i = model.transcribe(str(audio_inicio), language="es", verbose=False)
-        tx_f = model.transcribe(str(audio_fin), language="es", verbose=False)
-        texto_i = tx_i["text"].lower()
-        texto_f = tx_f["text"].lower()
-
-        tiene_cuenta = any(p in texto_i for p in PALABRAS_INICIO)
-        tiene_llegada = any(p in texto_f for p in PALABRAS_FIN)
-
-        alertas = []
-        if not tiene_cuenta:
-            alertas.append("no se oye cuenta atrás al inicio")
-        if not tiene_llegada:
-            alertas.append("no se oye llegada al final")
-
-        if alertas:
-            return False, "REVISAR — " + "; ".join(alertas) + f" ({dur:.0f}s)"
-        return True, f"OK ({dur:.0f}s, {size_mb:.1f} MB)"
-
-    finally:
-        audio_inicio.unlink(missing_ok=True)
-        audio_fin.unlink(missing_ok=True)
+    return True, f"OK ({dur:.0f}s, {size_mb:.1f} MB)"
 
 
 # ========== PROCESAMIENTO PRINCIPAL ==========
@@ -327,8 +282,7 @@ def procesar_video(video_path, model):
         print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(t_inicio_raw)}")
         t_inicio = max(0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
     else:
-        print("  ⚠ Señal de salida no detectada, empezando desde 0s")
-        print(f"    (revisa {transcript_path.name} para ver qué dijo el monitor)")
+        print("  ⚠ Inicio no detectado, empezando desde 0s")
         t_inicio = 0
 
     if t_fin_raw is not None:
@@ -352,7 +306,7 @@ def procesar_video(video_path, model):
 
     # Verificar resultado
     print("→ Verificando resultado...")
-    ok, detalle = verificar_corte(video_salida, t_inicio_raw, t_fin_raw, model)
+    ok, detalle = verificar_corte(video_salida, t_inicio_raw, t_fin_raw)
     if ok:
         print(f"  ✓ {detalle}")
     else:
