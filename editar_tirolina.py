@@ -24,39 +24,53 @@ SEGUNDOS_DESPUES_FIN = 2.0
 BUSCAR_INICIO_HASTA_PORCENTAJE = 0.55  # primer 55% del clip
 
 # Frases de SALIDA — el monitor las dice justo antes de soltar al viajero.
-# Whisper transcribe los números con comas ("3, 2, 1") y en español con comas también.
 PALABRAS_INICIO = [
+    # Cuenta atrás clásica
     "3, 2, 1",
     "3 2 1",
-    "tres, dos, uno",   # Whisper con comas
+    "tres, dos, uno",
     "tres dos uno",
     "uno dos tres",
+    "2, 1",
     "vamos, 3",
     "vamos 3",
-    "2, 1",             # a veces Whisper solo capta el final de la cuenta
+    # Variante observada en Sunview (cuenta "una, dos, uno")
+    "una, dos",
+    "uno, dos",
+    # Send-off del monitor — frases observadas en los vídeos reales
+    "buen vuelo",       # dicho justo antes de soltar (muy frecuente)
+    "nos vamos",        # "piernas arriba que nos vamos"
+    "allá vamos",
+    "ya vamos",
+    "disfruta",
+    "disfruta del vuelo",
+    "venga",            # comando de lanzamiento habitual
 ]
 
 # Palabras clave de LLEGADA — frases observadas en los vídeos reales
 PALABRAS_FIN = [
-    # Frases detectadas en los vídeos
-    "todo bien",            # "¿todo bien?" — variante frecuente de Whisper
-    "está bien",            # "¿tú está bien?" / "todo está bien"
-    "sobrevivimos",
-    "perfecto",
-    "apísima",
+    # Exclamaciones de llegada observadas en los vídeos reales
+    "hola",
+    "hala",
+    "hijos",            # exclamación frecuente al llegar
+    "no me lo",         # "¡no me lo creo!"
+    "madre mía", "madre mia",
+    # Preguntas de llegada
+    "todo bien",
+    "está bien",
     "cómo estás", "como estás",
-    # Saludos de llegada
-    "hola",                 # muy común al llegar
-    "hala",                 # exclamación de llegada
-    # Frases genéricas de bienvenida
-    "bien bien bien", "bien, bien, bien",
     "qué tal", "que tal",
     "cómo ha estado", "como ha estado",
     "cómo estuvo", "como estuvo",
-    "te ha gustado", "qué te ha parecido",
-    "bienvenido",
-    "yeee", "yee", "yuhu",
     "cómo fue", "como fue",
+    "te ha gustado", "qué te ha parecido",
+    # Otras frases de llegada
+    "sobrevivimos",
+    "perfecto",
+    "bienvenido",
+    "bien bien bien", "bien, bien, bien",
+    "yeee", "yee", "yuhu",
+    "apísima",
 ]
 
 # Calidad de salida
@@ -119,23 +133,37 @@ def transcribir_audio(audio_path, model):
     result = model.transcribe(
         str(audio_path),
         language="es",
-        verbose=False,
+        verbose=None,
         temperature=0,
     )
     return result
 
 
+def _es_ruido_viento(texto: str) -> bool:
+    """
+    Detecta si un segmento es alucinación de ruido de viento.
+    Whisper transcribe el viento como palabras muy repetidas:
+    "no, no, no, no..." o "pero no lo sé, pero no lo sé..."
+    """
+    palabras = texto.lower().split()
+    if len(palabras) < 6:
+        return False
+    ratio_unicas = len(set(palabras)) / len(palabras)
+    return ratio_unicas < 0.35
+
+
 def buscar_inicio(transcripcion, duracion):
     """
-    Busca la cuenta atrás en la primera parte del vídeo (antes del vuelo).
-    Devuelve el ÚLTIMO candidato encontrado (el más cercano al momento de soltar).
+    Busca el momento de lanzamiento en la primera parte del vídeo.
+    Estrategia 1: busca frases de PALABRAS_INICIO (cuenta atrás, send-off del monitor).
+    Estrategia 2 (fallback): detecta dónde empieza el ruido de viento; el segmento
+                             justo anterior es el último momento antes del vuelo.
     """
     limite = duracion * BUSCAR_INICIO_HASTA_PORCENTAJE
     segmentos = [s for s in transcripcion["segments"] if s["start"] <= limite]
     candidatos = []
 
     for i, seg in enumerate(segmentos):
-        # Texto del segmento actual + siguiente (por si la cuenta atrás se parte en dos)
         texto_ventana = seg["text"].lower().strip()
         if i + 1 < len(segmentos):
             sig = segmentos[i + 1]
@@ -147,10 +175,16 @@ def buscar_inicio(transcripcion, duracion):
                 candidatos.append((seg["start"], seg["text"]))
                 break
 
-    if not candidatos:
-        return None, None
+    if candidatos:
+        return candidatos[-1]
 
-    return candidatos[-1]
+    # Fallback: el vuelo empieza donde empieza el ruido de viento
+    for i, seg in enumerate(segmentos):
+        if _es_ruido_viento(seg["text"]):
+            prev = segmentos[i - 1] if i > 0 else seg
+            return prev["start"], f"[ruido viento] {prev['text']}"
+
+    return None, None
 
 
 def buscar_fin(transcripcion, duracion):
@@ -167,6 +201,87 @@ def buscar_fin(transcripcion, duracion):
             if palabra in texto:
                 return seg["start"], seg["text"]
     return None, None
+
+
+def detectar_vuelo_por_audio(audio_path, duracion):
+    """
+    Detecta inicio y fin del vuelo analizando el audio crudo, sin depender
+    de lo que diga el monitor. El vuelo = período más largo de ruido constante
+    (viento): energía alta y variabilidad baja, a diferencia del habla humana
+    que oscila mucho entre sílabas y silencios.
+    Funciona con cualquier idioma, monitor o parque.
+    Devuelve (t_inicio, t_fin) en segundos, o (None, None).
+    """
+    import wave
+    import numpy as np
+
+    try:
+        with wave.open(str(audio_path), 'rb') as wf:
+            sr  = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return None, None
+
+    y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    HOP = int(sr * 0.25)   # salto 0.25 s
+    WIN = int(sr * 0.50)   # ventana 0.5 s
+    n   = max(1, (len(y) - WIN) // HOP)
+
+    # Energía RMS por ventana
+    rms = np.array([
+        np.sqrt(np.mean(y[i*HOP : i*HOP + WIN] ** 2))
+        for i in range(n)
+    ])
+
+    # Suavizado leve
+    k = min(7, n)
+    rms_s = np.convolve(rms, np.ones(k) / k, mode='same')
+
+    # Coeficiente de variación local (ventana ±2 s = ±8 frames a 0.25 s/frame)
+    CV_WIN = 8
+    cv = np.array([
+        rms_s[max(0, i - CV_WIN) : i + CV_WIN + 1].std()
+        / (rms_s[max(0, i - CV_WIN) : i + CV_WIN + 1].mean() + 1e-8)
+        for i in range(n)
+    ])
+
+    # Zona de viento: energía > mediana×1.2  Y  variabilidad baja (CV < 0.5)
+    umbral_rms = np.median(rms_s) * 1.2
+    wind = (rms_s > umbral_rms) & (cv < 0.50)
+
+    # Rellenar huecos cortos (≤ 2 s) para no fragmentar el vuelo
+    GAP = 8
+    wind_s = np.array([
+        wind[max(0, i - GAP) : min(n, i + GAP + 1)].mean() >= 0.5
+        for i in range(n)
+    ])
+
+    # Extraer todos los bloques contiguos de "viento"
+    runs = []
+    in_run, start_run = False, 0
+    for i, w in enumerate(wind_s):
+        if w and not in_run:
+            in_run, start_run = True, i
+        elif not w and in_run:
+            in_run = False
+            runs.append((start_run, i))
+    if in_run:
+        runs.append((start_run, n))
+
+    if not runs:
+        return None, None
+
+    # El vuelo = bloque de viento más largo del clip
+    best = max(runs, key=lambda r: r[1] - r[0])
+    t_inicio = best[0] * HOP / sr
+    t_fin    = best[1] * HOP / sr
+
+    # Descartar si el período es demasiado corto para ser un vuelo real
+    if t_fin - t_inicio < 10:
+        return None, None
+
+    return t_inicio, t_fin
 
 
 def segundos_a_mmss(s):
@@ -271,25 +386,38 @@ def procesar_video(video_path, model):
             f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
 
     # Detectar puntos de corte (guardamos los valores raw antes de aplicar márgenes)
-    print("→ Buscando señal de salida...")
+    print("→ Buscando señal de salida y llegada...")
     t_inicio_raw, texto_inicio = buscar_inicio(transcripcion, duracion)
+    t_fin_raw,    texto_fin    = buscar_fin(transcripcion, duracion)
 
-    print("→ Buscando señal de llegada...")
-    t_fin_raw, texto_fin = buscar_fin(transcripcion, duracion)
+    # Fallback de audio: si alguno no se detectó por transcripción, analizar el WAV
+    if t_inicio_raw is None or t_fin_raw is None:
+        print("→ Aplicando análisis de audio (energía de viento)...")
+        t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
+        if t_inicio_raw is None and t_audio_ini is not None:
+            t_inicio_raw  = t_audio_ini
+            texto_inicio  = "[audio]"
+            print(f"  ✓ Inicio por audio:  {segundos_a_mmss(t_inicio_raw)}")
+        if t_fin_raw is None and t_audio_fin is not None:
+            t_fin_raw   = t_audio_fin
+            texto_fin   = "[audio]"
+            print(f"  ✓ Fin por audio:     {segundos_a_mmss(t_fin_raw)}")
 
     # Aplicar márgenes
     if t_inicio_raw is not None:
-        print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(t_inicio_raw)}")
+        if texto_inicio != "[audio]":
+            print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(t_inicio_raw)}")
         t_inicio = max(0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
     else:
         print("  ⚠ Inicio no detectado, empezando desde 0s")
         t_inicio = 0
 
     if t_fin_raw is not None:
-        print(f"  ✓ Llegada detectada: '{texto_fin.strip()}' → {segundos_a_mmss(t_fin_raw)}")
+        if texto_fin != "[audio]":
+            print(f"  ✓ Llegada detectada: '{texto_fin.strip()}' → {segundos_a_mmss(t_fin_raw)}")
         t_fin = min(duracion, t_fin_raw + SEGUNDOS_DESPUES_FIN)
     else:
-        print("  ⚠ Señal de llegada no detectada, usando fin del clip")
+        print("  ⚠ Fin no detectado, usando fin del clip")
         print(f"    (revisa {transcript_path.name} para ver qué dijo el monitor)")
         t_fin = duracion
 

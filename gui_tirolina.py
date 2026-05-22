@@ -10,6 +10,13 @@ import os
 import sys
 from pathlib import Path
 
+# pythonw.exe no tiene consola — algunas librerías (tqdm, whisper) fallan
+# al escribir en sys.stdout/stderr si son None
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     DRAG_DROP = True
@@ -18,7 +25,7 @@ except ImportError:
 
 from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
-    buscar_inicio, buscar_fin,
+    buscar_inicio, buscar_fin, detectar_vuelo_por_audio,
     editar_video, verificar_corte,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES, MODELO_WHISPER,
     SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
@@ -224,9 +231,21 @@ class App(BaseVentana):
                 t0_raw, txt0 = buscar_inicio(tx, duracion)
                 t1_raw, txt1 = buscar_fin(tx, duracion)
 
+                # Fallback: análisis de energía de audio cuando la transcripción no detecta
+                if t0_raw is None or t1_raw is None:
+                    self._log("Analizando energía de audio...\n", "info")
+                    t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
+                    if t0_raw is None and t_audio_ini is not None:
+                        t0_raw, txt0 = t_audio_ini, "[audio]"
+                    if t1_raw is None and t_audio_fin is not None:
+                        t1_raw, txt1 = t_audio_fin, "[audio]"
+
                 if t0_raw is not None:
                     t0 = max(0, t0_raw - SEGUNDOS_ANTES_INICIO)
-                    self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
+                    if txt0 == "[audio]":
+                        self._log(f"✓ Salida (audio):  {segundos_a_mmss(t0_raw)}\n", "ok")
+                    else:
+                        self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
                 else:
                     t0 = 0
                     self._log("⚠ Inicio no detectado — lo que oyó Whisper al principio:\n", "aviso")
@@ -237,7 +256,10 @@ class App(BaseVentana):
 
                 if t1_raw is not None:
                     t1 = min(duracion, t1_raw + SEGUNDOS_DESPUES_FIN)
-                    self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
+                    if txt1 == "[audio]":
+                        self._log(f"✓ Llegada (audio): {segundos_a_mmss(t1_raw)}\n", "ok")
+                    else:
+                        self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
                 else:
                     t1 = duracion
                     self._log("⚠ Llegada no detectada — lo que oyó Whisper al final:\n", "aviso")
