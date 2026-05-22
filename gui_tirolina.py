@@ -27,6 +27,8 @@ from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
     buscar_inicio, buscar_fin, detectar_vuelo_por_audio,
     editar_video, verificar_corte,
+    verificar_duracion, verificar_resolucion, verificar_audio_nivel,
+    verificar_inicio_limpio, verificar_llegada_detectada,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES, MODELO_WHISPER,
     SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
     BUSCAR_INICIO_HASTA_PORCENTAJE,
@@ -278,13 +280,23 @@ class App(BaseVentana):
                 editar_video(video, t0, t1, salida)
 
                 self._log("Verificando...\n", "info")
-                ok, detalle = verificar_corte(salida, t0_raw, t1_raw)
-                self._log(f"{'✓' if ok else '⚠'} {detalle}\n\n", "ok" if ok else "aviso")
+                checks = verificar_corte(salida)
+                for ch_nombre, ch_ok, ch_det in checks:
+                    self._log(
+                        f"  {'✓' if ch_ok else '⚠'} {ch_nombre}: {ch_det}\n",
+                        "ok" if ch_ok else "aviso",
+                    )
+                ok     = all(ch_ok for _, ch_ok, _ in checks)
+                detalle = (
+                    " | ".join(f"{n}:{d}" for n, ch_ok, d in checks if not ch_ok)
+                    or "OK"
+                )
+                self._log(("\n" if ok else "⚠ Revisa los puntos marcados arriba.\n\n"), "aviso" if not ok else "info")
                 resultados.append({
                     "nombre": video.name,
                     "ok": ok,
                     "detalle": detalle,
-                    "necesita_ajuste": (t0_raw is None or t1_raw is None),
+                    "necesita_ajuste": not ok,
                     "video_path": video,
                     "salida_path": salida,
                     "duracion": duracion,

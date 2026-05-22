@@ -345,25 +345,145 @@ def editar_video(video_entrada, inicio, fin, video_salida):
     subprocess.run(cmd, capture_output=True, check=True)
 
 
-def verificar_corte(video_salida, t_inicio_raw, t_fin_raw):
-    """Comprueba tamaño y duración del clip. Devuelve (ok: bool, detalle: str)."""
-    if not video_salida.exists():
-        return False, "archivo de salida no encontrado"
+# ========== VERIFICACIÓN MULTI-AGENTE ==========
+# Cada función devuelve (ok: bool, detalle: str) y es independiente.
 
-    size_mb = video_salida.stat().st_size / (1024 * 1024)
+def verificar_duracion(video_path):
+    """Duración entre 20 y 180 segundos."""
+    try:
+        dur = obtener_duracion(video_path)
+        if dur < 20:
+            return False, f"muy corto ({dur:.0f}s, mínimo 20s)"
+        if dur > 180:
+            return False, f"muy largo ({dur:.0f}s, máximo 3 min)"
+        return True, f"{dur:.0f}s"
+    except Exception as e:
+        return False, str(e)
+
+
+def verificar_resolucion(video_path):
+    """Resolución exactamente 1920×1080."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0", str(video_path),
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+        w, h = (int(x) for x in out.split(","))
+        if w == 1920 and h == 1080:
+            return True, f"{w}×{h}"
+        return False, f"esperado 1920×1080, obtenido {w}×{h}"
+    except Exception as e:
+        return False, str(e)
+
+
+def verificar_audio_nivel(video_path):
+    """Nivel de audio: no mudo (< −50 dBFS) ni saturado (max > −1 dBFS)."""
+    import re
+    try:
+        cmd = ["ffmpeg", "-i", str(video_path), "-af", "volumedetect", "-f", "null", "-"]
+        stderr = subprocess.run(cmd, capture_output=True, text=True).stderr
+        m_mean = re.search(r"mean_volume:\s*([-\d.]+)\s*dB", stderr)
+        m_max  = re.search(r"max_volume:\s*([-\d.]+)\s*dB", stderr)
+        if not m_mean:
+            return False, "no se pudo leer el nivel de audio"
+        mean = float(m_mean.group(1))
+        peak = float(m_max.group(1)) if m_max else mean
+        if mean < -50:
+            return False, f"audio mudo ({mean:.1f} dBFS)"
+        if peak > -1:
+            return False, f"audio saturado (pico {peak:.1f} dBFS)"
+        return True, f"media {mean:.1f} dBFS, pico {peak:.1f} dBFS"
+    except Exception as e:
+        return False, str(e)
+
+
+def _wav_rms_cv(video_path, ss=None, duracion=None):
+    """Extrae un segmento de audio y devuelve (rms_medio, coef_variacion)."""
+    import wave
+    import numpy as np
+    tmp = Path("_check_tmp.wav")
+    try:
+        cmd = ["ffmpeg", "-y"]
+        if ss is not None:
+            cmd += ["-ss", str(ss)]
+        cmd += ["-i", str(video_path)]
+        if duracion is not None:
+            cmd += ["-t", str(duracion)]
+        cmd += ["-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(tmp)]
+        subprocess.run(cmd, capture_output=True, check=True)
+        with wave.open(str(tmp), "rb") as wf:
+            sr  = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        HOP, WIN = int(sr * 0.1), int(sr * 0.2)
+        n = max(1, (len(y) - WIN) // HOP)
+        frames = np.array([np.sqrt(np.mean(y[i*HOP:i*HOP+WIN]**2)) for i in range(n)])
+        rms = float(frames.mean())
+        cv  = float(frames.std() / (rms + 1e-8))
+        return rms, cv
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def verificar_inicio_limpio(video_path):
+    """
+    Los primeros 3s no deben ser silencio.
+    Silencio al inicio indica que el corte fue demasiado tarde
+    o que el clip empieza con pantalla negra.
+    """
+    try:
+        rms, _ = _wav_rms_cv(video_path, duracion=3)
+        if rms < 0.005:
+            return False, f"inicio silencioso (RMS={rms:.4f}) — posible corte tarde"
+        return True, f"RMS={rms:.3f}"
+    except Exception as e:
+        return False, str(e)
+
+
+def verificar_llegada_detectada(video_path):
+    """
+    Los últimos 5s deben tener voz (energía variable).
+    Ruido constante = aún en vuelo. Silencio = corte antes de la llegada.
+    """
+    try:
+        dur = obtener_duracion(video_path)
+        rms, cv = _wav_rms_cv(video_path, ss=max(0, dur - 5))
+        if rms < 0.005:
+            return False, "final silencioso — corte antes de la llegada"
+        if cv < 0.30:
+            return False, f"final con ruido constante (CV={cv:.2f}) — vuelo sin llegada capturada"
+        return True, f"voz detectada (CV={cv:.2f})"
+    except Exception as e:
+        return False, str(e)
+
+
+def verificar_corte(video_path, *_args, **_kwargs):
+    """
+    Orquestador: ejecuta todos los verificadores y devuelve
+    lista de (nombre, ok, detalle).
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        return [("archivo", False, "no encontrado")]
+
+    size_mb = video_path.stat().st_size / (1024 * 1024)
     if size_mb < 0.5:
-        return False, f"archivo muy pequeño ({size_mb:.1f} MB)"
+        return [("archivo", False, f"muy pequeño ({size_mb:.1f} MB)")]
 
-    dur = obtener_duracion(video_salida)
-    if dur < 15:
-        return False, f"clip demasiado corto ({dur:.0f}s)"
-    if dur > 300:
-        return False, f"clip demasiado largo ({dur:.0f}s)"
-
-    if t_inicio_raw is None or t_fin_raw is None:
-        return False, f"requiere ajuste manual ({dur:.0f}s)"
-
-    return True, f"OK ({dur:.0f}s, {size_mb:.1f} MB)"
+    checks = [
+        ("duración",   verificar_duracion),
+        ("resolución", verificar_resolucion),
+        ("audio",      verificar_audio_nivel),
+        ("inicio",     verificar_inicio_limpio),
+        ("llegada",    verificar_llegada_detectada),
+    ]
+    resultados = []
+    for nombre, fn in checks:
+        ok, detalle = fn(video_path)
+        resultados.append((nombre, ok, detalle))
+    return resultados
 
 
 # ========== PROCESAMIENTO PRINCIPAL ==========
@@ -432,13 +552,13 @@ def procesar_video(video_path, model):
     video_salida = CARPETA_SALIDA / f"{video_path.stem}_FINAL.mp4"
     editar_video(video_path, t_inicio, t_fin, video_salida)
 
-    # Verificar resultado
+    # Verificar resultado (multi-agente)
     print("→ Verificando resultado...")
-    ok, detalle = verificar_corte(video_salida, t_inicio_raw, t_fin_raw)
-    if ok:
-        print(f"  ✓ {detalle}")
-    else:
-        print(f"  ⚠ {detalle}")
+    checks = verificar_corte(video_salida)
+    for nombre, chk_ok, det in checks:
+        print(f"  {'✓' if chk_ok else '⚠'} {nombre}: {det}")
+    ok     = all(chk_ok for _, chk_ok, _ in checks)
+    detalle = " | ".join(f"{n}:{d}" for n, chk_ok, d in checks if not chk_ok) or "OK"
 
     audio_tmp.unlink(missing_ok=True)
     return ok, detalle
