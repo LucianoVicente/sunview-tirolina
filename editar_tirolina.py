@@ -246,12 +246,16 @@ def detectar_vuelo_por_audio(audio_path, duracion):
         for i in range(n)
     ])
 
-    # Zona de viento: energía > mediana×1.2  Y  variabilidad baja (CV < 0.5)
-    umbral_rms = np.median(rms_s) * 1.2
-    wind = (rms_s > umbral_rms) & (cv < 0.50)
+    # Viento = energía por encima del suelo de ruido (5 % del pico) Y CV bajo.
+    # Usar el pico en vez de la mediana evita el fallo cuando el vuelo
+    # ocupa >50 % del clip (la mediana sería ya nivel de vuelo y el umbral
+    # quedaría por encima de todos los frames).
+    noise_floor = np.max(rms_s) * 0.05
+    wind = (rms_s > noise_floor) & (cv < 0.50)
 
-    # Rellenar huecos cortos (≤ 2 s) para no fragmentar el vuelo
-    GAP = 8
+    # Rellenar huecos de hasta 5 s — necesario cuando el pasajero grita
+    # durante el vuelo (gritos de 3-6 s rompen el bloque de viento).
+    GAP = 20   # frames × 0.25 s = 5 s
     wind_s = np.array([
         wind[max(0, i - GAP) : min(n, i + GAP + 1)].mean() >= 0.5
         for i in range(n)
