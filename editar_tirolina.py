@@ -98,6 +98,11 @@ def comprobar_dependencias():
         print("   Descárgalo de: https://www.gyan.dev/ffmpeg/builds/")
         return False
     print("✓ FFmpeg encontrado")
+    if not shutil.which("ffprobe"):
+        print("❌ FFprobe no encontrado (suele venir junto con FFmpeg).")
+        print("   Asegúrate de que C:\\ffmpeg\\bin está en el PATH.")
+        return False
+    print("✓ FFprobe encontrado")
     try:
         import whisper
         print("✓ Whisper encontrado")
@@ -330,6 +335,10 @@ def confirmar_o_ajustar(inicio, fin, duracion, video_path):
 
 def editar_video(video_entrada, inicio, fin, video_salida):
     duracion_corte = fin - inicio
+    if duracion_corte <= 0:
+        raise ValueError(
+            f"duración de corte inválida (inicio={inicio:.1f}s, fin={fin:.1f}s)"
+        )
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(inicio),
@@ -406,8 +415,11 @@ def verificar_audio_nivel(video_path):
 def _wav_rms_cv(video_path, ss=None, duracion=None):
     """Extrae un segmento de audio y devuelve (rms_medio, coef_variacion)."""
     import wave
+    import tempfile
     import numpy as np
-    tmp = Path("_check_tmp.wav")
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         cmd = ["ffmpeg", "-y"]
         if ss is not None:

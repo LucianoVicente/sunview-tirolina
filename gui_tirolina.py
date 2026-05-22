@@ -27,8 +27,6 @@ from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
     buscar_inicio, buscar_fin, detectar_vuelo_por_audio,
     editar_video, verificar_corte,
-    verificar_duracion, verificar_resolucion, verificar_audio_nivel,
-    verificar_inicio_limpio, verificar_llegada_detectada,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES, MODELO_WHISPER,
     SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
     BUSCAR_INICIO_HASTA_PORCENTAJE,
@@ -460,8 +458,17 @@ class App(BaseVentana):
         def _do():
             try:
                 editar_video(r["video_path"], t0, t1, r["salida_path"])
-                self.cola.put(("estado", lbl_estado,
-                               f"✓ OK ({t1 - t0:.0f}s)", COLORES["ok"]))
+                # Re-verificar con los mismos 5 agentes que el corte automático
+                checks = verificar_corte(r["salida_path"])
+                n_ok = sum(1 for _, c_ok, _ in checks if c_ok)
+                n = len(checks)
+                if n_ok == n:
+                    self.cola.put(("estado", lbl_estado,
+                                   f"✓ {n_ok}/{n} ({t1 - t0:.0f}s)", COLORES["ok"]))
+                else:
+                    fallos = ", ".join(nom for nom, c_ok, _ in checks if not c_ok)
+                    self.cola.put(("estado", lbl_estado,
+                                   f"⚠ {n_ok}/{n} (falla: {fallos})", COLORES["aviso"]))
             except Exception as exc:
                 self.cola.put(("estado", lbl_estado,
                                f"✗ {exc}", COLORES["error"]))
