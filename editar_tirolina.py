@@ -3,10 +3,12 @@ Sunview Park - Editor automático de vídeos de tirolina
 ========================================================
 """
 
+import atexit
 import os
-import sys
 import subprocess
 import shutil
+import sys
+import tempfile
 from pathlib import Path
 
 # ========== CONFIGURACIÓN ==========
@@ -24,28 +26,40 @@ SEGUNDOS_DESPUES_FIN = 2.0
 BUSCAR_INICIO_HASTA_PORCENTAJE = 0.55  # primer 55% del clip
 
 # Frases de SALIDA — el monitor las dice justo antes de soltar al viajero.
-PALABRAS_INICIO = [
-    # Cuenta atrás clásica
+# CUENTA ATRÁS = señal fuerte e inequívoca del lanzamiento.
+PALABRAS_INICIO_FUERTES = [
     "3, 2, 1",
     "3 2 1",
     "tres, dos, uno",
     "tres dos uno",
     "uno dos tres",
-    "2, 1",
-    "vamos, 3",
-    "vamos 3",
+    "3, 2,",
+    "tres, dos,",
     # Variante observada en Sunview (cuenta "una, dos, uno")
-    "una, dos",
-    "uno, dos",
-    # Send-off del monitor — frases observadas en los vídeos reales
-    "buen vuelo",       # dicho justo antes de soltar (muy frecuente)
+    "una, dos, uno",
+    "uno, dos, uno",
+]
+
+# SEND-OFF = frases más débiles que el monitor también dice como saludo/presentación.
+# Solo se usan si NO se encuentra una cuenta atrás fuerte.
+PALABRAS_INICIO_DEBILES = [
+    "buen vuelo",       # también se dice al PRESENTAR al rider — ver filtro abajo
     "nos vamos",        # "piernas arriba que nos vamos"
     "allá vamos",
     "ya vamos",
     "disfruta",
     "disfruta del vuelo",
-    "venga",            # comando de lanzamiento habitual
+    "venga, nos vamos",
+    "venga nos vamos",
 ]
+
+# Compatibilidad: alias para tests/otros consumidores
+PALABRAS_INICIO = PALABRAS_INICIO_FUERTES + PALABRAS_INICIO_DEBILES
+
+# Zona de presentación: en los primeros segundos el monitor dice
+# "Número X, número X, buen vuelo" como presentación, NO como lanzamiento.
+# Ignorar matches en esta ventana si el segmento contiene "número".
+ZONA_PRESENTACION_S = 12
 
 # Palabras clave de LLEGADA — frases observadas en los vídeos reales
 PALABRAS_FIN = [
@@ -64,13 +78,27 @@ PALABRAS_FIN = [
     "cómo estuvo", "como estuvo",
     "cómo fue", "como fue",
     "te ha gustado", "qué te ha parecido",
-    # Otras frases de llegada
+    # Otras frases de llegada en español
     "sobrevivimos",
     "perfecto",
     "bienvenido",
     "bien bien bien", "bien, bien, bien",
+    "bien, bien", "bien bien",
+    "buenas",          # "Buenas" suelto al llegar
     "yeee", "yee", "yuhu",
     "apísima",
+    # Reacciones de llegada en otros idiomas (clientes extranjeros).
+    # Whisper en modo "es" capta fonéticamente palabras comunes EN/FR/IT/DE
+    # cuando son cortas y muy marcadas.
+    # — Inglés
+    "thank you", "thanks", "amazing", "awesome", "incredible", "wow",
+    "oh my god", "all good", "very good", "fantastic",
+    # — Francés
+    "merci", "génial", "incroyable", "trop bien", "magnifique",
+    # — Italiano
+    "grazie", "bellissimo", "fantastico", "incredibile",
+    # — Alemán
+    "danke", "wunderbar",
 ]
 
 # Calidad de salida
@@ -82,8 +110,57 @@ LOGO_MARGEN = 60   # distancia desde la esquina en píxeles
 
 EXTENSIONES = (".mp4", ".mov", ".MP4", ".MOV", ".avi", ".AVI", ".mkv", ".MKV")
 
+# Orden de fallback si el modelo principal no cabe en RAM/VRAM.
+# small ≈ 1.5 GB, base ≈ 0.5 GB, tiny ≈ 0.2 GB.
+MODELOS_WHISPER_FALLBACK = ["small", "base", "tiny"]
+
 # ========== MODO AUTOMÁTICO ==========
 MODO_AUTO = True        # True = sin preguntas, procesa todo solo
+
+
+def cargar_modelo_whisper(preferido=None, log=None):
+    """
+    Carga el modelo Whisper más grande que quepa en memoria.
+    Empieza por `preferido` (o MODELO_WHISPER) y degrada a base/tiny si OOM.
+
+    `log` es un callable opcional log(nivel, msg) — la GUI lo usa para mostrar
+    qué modelo se cargó. Si es None, se imprime en consola.
+
+    Devuelve (modelo, nombre_modelo_cargado).
+    Lanza RuntimeError con todos los errores acumulados si ninguno carga.
+    """
+    import whisper
+
+    def _say(nivel, msg):
+        if log is not None:
+            log(nivel, msg)
+        else:
+            print(f"  {'⚠' if nivel == 'aviso' else '✓'} {msg}")
+
+    # Construir orden: empezar por el preferido, luego degradar.
+    pref = preferido or MODELO_WHISPER
+    orden = [pref] + [m for m in MODELOS_WHISPER_FALLBACK if m != pref]
+
+    errores = []
+    for nombre in orden:
+        try:
+            modelo = whisper.load_model(nombre)
+            if nombre != pref:
+                _say("aviso", f"Modelo '{pref}' no cargó; usando '{nombre}' (menos preciso pero ligero)")
+            else:
+                _say("ok", f"Modelo Whisper '{nombre}' cargado")
+            return modelo, nombre
+        except (MemoryError, RuntimeError, OSError) as e:
+            errores.append(f"{nombre}: {type(e).__name__}: {e}")
+            continue
+
+    raise RuntimeError(
+        "No se pudo cargar NINGÚN modelo Whisper. Revisa:\n"
+        "  • Conexión a internet (primera vez se descarga ~500 MB)\n"
+        "  • Espacio libre en disco\n"
+        "  • Memoria RAM disponible\n"
+        "Detalles:\n  " + "\n  ".join(errores)
+    )
 
 
 # ========== UTILIDADES ==========
@@ -157,33 +234,63 @@ def _es_ruido_viento(texto: str) -> bool:
     return ratio_unicas < 0.35
 
 
+def _es_presentacion(seg, texto_ventana):
+    """
+    Detecta el saludo inicial del monitor: "Número X, número X, buen vuelo".
+    Se dice al PRESENTAR al rider (mucho antes del lanzamiento real) y es
+    el principal falso positivo de inicio. Solo aplica en la zona de presentación.
+    """
+    if seg["start"] >= ZONA_PRESENTACION_S:
+        return False
+    return "número" in texto_ventana or "numero" in texto_ventana
+
+
 def buscar_inicio(transcripcion, duracion):
     """
     Busca el momento de lanzamiento en la primera parte del vídeo.
-    Estrategia 1: busca frases de PALABRAS_INICIO (cuenta atrás, send-off del monitor).
-    Estrategia 2 (fallback): detecta dónde empieza el ruido de viento; el segmento
-                             justo anterior es el último momento antes del vuelo.
+
+    Estrategia (en orden):
+    1. Cuenta atrás fuerte ("3, 2, 1", "tres, dos, uno") — señal inequívoca.
+    2. Send-off débil ("nos vamos", "buen vuelo"...) — ignorando la zona de
+       presentación (primeros segundos cuando el monitor dice "Número X buen vuelo").
+    3. Ruido de viento — el bloque previo al inicio del viento.
     """
     limite = duracion * BUSCAR_INICIO_HASTA_PORCENTAJE
     segmentos = [s for s in transcripcion["segments"] if s["start"] <= limite]
-    candidatos = []
 
-    for i, seg in enumerate(segmentos):
-        texto_ventana = seg["text"].lower().strip()
+    def texto_con_lookahead(i, seg):
+        texto = seg["text"].lower().strip()
         if i + 1 < len(segmentos):
             sig = segmentos[i + 1]
             if sig["start"] - seg["start"] < 10:
-                texto_ventana += " " + sig["text"].lower().strip()
+                texto += " " + sig["text"].lower().strip()
+        return texto
 
-        for palabra in PALABRAS_INICIO:
-            if palabra in texto_ventana:
-                candidatos.append((seg["start"], seg["text"]))
+    # Pasada 1: cuenta atrás fuerte (último match)
+    fuertes = []
+    for i, seg in enumerate(segmentos):
+        texto = texto_con_lookahead(i, seg)
+        for palabra in PALABRAS_INICIO_FUERTES:
+            if palabra in texto:
+                fuertes.append((seg["start"], seg["text"]))
                 break
+    if fuertes:
+        return fuertes[-1]
 
-    if candidatos:
-        return candidatos[-1]
+    # Pasada 2: send-off débil, ignorando la presentación inicial
+    debiles = []
+    for i, seg in enumerate(segmentos):
+        texto = texto_con_lookahead(i, seg)
+        if _es_presentacion(seg, texto):
+            continue
+        for palabra in PALABRAS_INICIO_DEBILES:
+            if palabra in texto:
+                debiles.append((seg["start"], seg["text"]))
+                break
+    if debiles:
+        return debiles[-1]
 
-    # Fallback: el vuelo empieza donde empieza el ruido de viento
+    # Pasada 3: ruido de viento como fallback
     for i, seg in enumerate(segmentos):
         if _es_ruido_viento(seg["text"]):
             prev = segmentos[i - 1] if i > 0 else seg
@@ -194,13 +301,14 @@ def buscar_inicio(transcripcion, duracion):
 
 def buscar_fin(transcripcion, duracion):
     """
-    Busca la señal de llegada desde el final hacia atrás.
-    Solo busca en el último 30% del vídeo para evitar falsos positivos.
+    Busca la PRIMERA señal de llegada en el último 30% del vídeo.
+    Buscar la primera (no la última) evita extender el corte con conversación
+    post-llegada (saludos repetidos al equipo de tierra, reacciones, etc.).
     """
     limite_fin = duracion * 0.70
-    for seg in reversed(transcripcion["segments"]):
+    for seg in transcripcion["segments"]:
         if seg["start"] < limite_fin:
-            break
+            continue
         texto = seg["text"].lower().strip()
         for palabra in PALABRAS_FIN:
             if palabra in texto:
@@ -208,14 +316,10 @@ def buscar_fin(transcripcion, duracion):
     return None, None
 
 
-def detectar_vuelo_por_audio(audio_path, duracion):
+def _bloques_de_viento(audio_path):
     """
-    Detecta inicio y fin del vuelo analizando el audio crudo, sin depender
-    de lo que diga el monitor. El vuelo = período más largo de ruido constante
-    (viento): energía alta y variabilidad baja, a diferencia del habla humana
-    que oscila mucho entre sílabas y silencios.
-    Funciona con cualquier idioma, monitor o parque.
-    Devuelve (t_inicio, t_fin) en segundos, o (None, None).
+    Analiza el audio y devuelve [(t_ini, t_fin), ...] con todos los bloques
+    de viento sostenido. Lista vacía si no se pudo leer o no hay viento.
     """
     import wave
     import numpy as np
@@ -225,25 +329,21 @@ def detectar_vuelo_por_audio(audio_path, duracion):
             sr  = wf.getframerate()
             raw = wf.readframes(wf.getnframes())
     except Exception:
-        return None, None
+        return []
 
     y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-    HOP = int(sr * 0.25)   # salto 0.25 s
-    WIN = int(sr * 0.50)   # ventana 0.5 s
+    HOP = int(sr * 0.25)
+    WIN = int(sr * 0.50)
     n   = max(1, (len(y) - WIN) // HOP)
 
-    # Energía RMS por ventana
     rms = np.array([
         np.sqrt(np.mean(y[i*HOP : i*HOP + WIN] ** 2))
         for i in range(n)
     ])
-
-    # Suavizado leve
     k = min(7, n)
     rms_s = np.convolve(rms, np.ones(k) / k, mode='same')
 
-    # Coeficiente de variación local (ventana ±2 s = ±8 frames a 0.25 s/frame)
     CV_WIN = 8
     cv = np.array([
         rms_s[max(0, i - CV_WIN) : i + CV_WIN + 1].std()
@@ -251,22 +351,17 @@ def detectar_vuelo_por_audio(audio_path, duracion):
         for i in range(n)
     ])
 
-    # Viento = energía por encima del suelo de ruido (5 % del pico) Y CV bajo.
-    # Usar el pico en vez de la mediana evita el fallo cuando el vuelo
-    # ocupa >50 % del clip (la mediana sería ya nivel de vuelo y el umbral
-    # quedaría por encima de todos los frames).
+    # Viento = energía por encima del suelo (5 % del pico) Y baja variabilidad.
     noise_floor = np.max(rms_s) * 0.05
     wind = (rms_s > noise_floor) & (cv < 0.50)
 
-    # Rellenar huecos de hasta 5 s — necesario cuando el pasajero grita
-    # durante el vuelo (gritos de 3-6 s rompen el bloque de viento).
-    GAP = 20   # frames × 0.25 s = 5 s
+    # Rellenar huecos de hasta 5 s (gritos del pasajero).
+    GAP = 20
     wind_s = np.array([
         wind[max(0, i - GAP) : min(n, i + GAP + 1)].mean() >= 0.5
         for i in range(n)
     ])
 
-    # Extraer todos los bloques contiguos de "viento"
     runs = []
     in_run, start_run = False, 0
     for i, w in enumerate(wind_s):
@@ -278,19 +373,43 @@ def detectar_vuelo_por_audio(audio_path, duracion):
     if in_run:
         runs.append((start_run, n))
 
-    if not runs:
+    # Convertir a segundos y filtrar bloques cortos (<10 s ≠ vuelo real)
+    bloques = [
+        (a * HOP / sr, b * HOP / sr)
+        for a, b in runs
+        if (b - a) * HOP / sr >= 10
+    ]
+    return bloques
+
+
+def detectar_vuelo_por_audio(audio_path, duracion):
+    """
+    Detecta inicio y fin del vuelo analizando el audio crudo, sin depender
+    de lo que diga el monitor. El vuelo = bloque más largo de viento sostenido.
+    Funciona con cualquier idioma, monitor o parque.
+    Devuelve (t_inicio, t_fin) en segundos, o (None, None).
+    """
+    bloques = _bloques_de_viento(audio_path)
+    if not bloques:
         return None, None
+    best = max(bloques, key=lambda b: b[1] - b[0])
+    return best
 
-    # El vuelo = bloque de viento más largo del clip
-    best = max(runs, key=lambda r: r[1] - r[0])
-    t_inicio = best[0] * HOP / sr
-    t_fin    = best[1] * HOP / sr
 
-    # Descartar si el período es demasiado corto para ser un vuelo real
-    if t_fin - t_inicio < 10:
-        return None, None
-
-    return t_inicio, t_fin
+def detectar_multiples_vuelos(audio_path, separacion_min=15):
+    """
+    Devuelve True si hay 2+ bloques de viento ≥10 s separados por
+    ≥`separacion_min` s de no-viento. Indica que el clip contiene
+    más de un vuelo y debe partirse manualmente.
+    """
+    bloques = _bloques_de_viento(audio_path)
+    if len(bloques) < 2:
+        return False
+    bloques = sorted(bloques)
+    for (_, fin1), (ini2, _) in zip(bloques, bloques[1:]):
+        if ini2 - fin1 >= separacion_min:
+            return True
+    return False
 
 
 def segundos_a_mmss(s):
@@ -502,93 +621,249 @@ def verificar_corte(video_path, *_args, **_kwargs):
     return resultados
 
 
+# ========== VALIDACIÓN PREVIA ==========
+def validar_video(video_path):
+    """
+    Comprobaciones tempranas antes de procesar.
+    Detecta errores comunes que de otro modo crashearían a mitad de proceso
+    (sin audio, placeholder de OneDrive, fichero corrupto, ruta inválida).
+    Devuelve (ok: bool, motivo: str).
+    """
+    video_path = Path(video_path)
+
+    if not video_path.exists():
+        return False, "no encontrado"
+
+    # OneDrive guarda placeholders de pocos bytes para archivos no descargados.
+    # Cualquier vídeo real pesa muchísimo más que 1 KB.
+    try:
+        size = video_path.stat().st_size
+    except OSError as e:
+        return False, f"no se puede leer: {e}"
+    if size < 1024:
+        return False, "archivo vacío o sin descargar (placeholder de OneDrive)"
+
+    # ffprobe valida formato y presencia de pista de audio/vídeo.
+    if not shutil.which("ffprobe"):
+        return False, "ffprobe no instalado (instala FFmpeg)"
+
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "ffprobe se colgó leyendo el archivo (posible corrupción)"
+    except Exception as e:
+        return False, f"error al validar: {e}"
+
+    if result.returncode != 0:
+        msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "formato no reconocido"
+        return False, f"no es un vídeo válido ({msg[:80]})"
+
+    codecs = [c for c in result.stdout.strip().splitlines() if c]
+    if "video" not in codecs:
+        return False, "no tiene pista de vídeo"
+    if "audio" not in codecs:
+        return False, "sin pista de audio (cámara con micrófono apagado)"
+
+    return True, "ok"
+
+
+# ========== ARCHIVO TEMPORAL DE AUDIO ==========
+# Único por proceso para evitar colisiones cuando hay dos instancias corriendo.
+# Se borra al salir incluso si hay crash.
+_AUDIO_TMP_PATH = None
+
+
+def audio_tmp_path():
+    """Devuelve la ruta del WAV temporal de este proceso, creándola si hace falta."""
+    global _AUDIO_TMP_PATH
+    if _AUDIO_TMP_PATH is None:
+        fd, name = tempfile.mkstemp(prefix="sunview_audio_", suffix=".wav")
+        os.close(fd)
+        _AUDIO_TMP_PATH = Path(name)
+        atexit.register(_limpiar_audio_tmp)
+    return _AUDIO_TMP_PATH
+
+
+def _limpiar_audio_tmp():
+    if _AUDIO_TMP_PATH is not None:
+        try:
+            _AUDIO_TMP_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ========== RESOLUCIÓN DE CORTE COMPARTIDA ==========
+# Esta función es la ÚNICA fuente de verdad para decidir t_inicio/t_fin.
+# Tanto CLI (procesar_video) como GUI (gui_tirolina._worker) la usan.
+# Cualquier cambio en la lógica de detección se aplica automáticamente a ambos flujos.
+def resolver_corte(transcripcion, duracion, audio_path):
+    """
+    Combina detección por frase + audio para devolver el corte final.
+
+    Devuelve dict:
+      t_inicio, t_fin              — segundos absolutos con márgenes aplicados
+      t_inicio_raw, t_fin_raw      — segundos sin márgenes (None si no detectado)
+      texto_inicio, texto_fin      — frase que disparó la detección, o "[audio]"
+      sin_vuelo                    — True si ni frase ni audio detectaron un vuelo
+      logs                         — lista de (nivel, mensaje) para que el caller imprima/loguee
+    """
+    t_inicio_raw, texto_inicio = buscar_inicio(transcripcion, duracion)
+    t_fin_raw,    texto_fin    = buscar_fin(transcripcion, duracion)
+    t_audio_ini, t_audio_fin   = detectar_vuelo_por_audio(audio_path, duracion)
+
+    logs: list[tuple[str, str]] = []
+
+    # Aviso multi-vuelo: si hay 2+ vuelos en el clip, advertir.
+    # No intentamos auto-split (mantenemos el corte del bloque más largo).
+    if detectar_multiples_vuelos(audio_path):
+        logs.append((
+            "aviso",
+            "Se detectaron 2 o más vuelos en este clip — "
+            "se cortará solo el más largo. Si necesitas los otros, "
+            "ajústalo a mano."
+        ))
+
+    # ─── INICIO ───
+    # Solo aceptamos el override de audio cuando la frase está muy lejos del
+    # viento real (>30 s) — claro falso positivo (saludo/instrucciones).
+    if t_inicio_raw is None and t_audio_ini is not None:
+        t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
+        logs.append(("ok", f"Inicio por audio: {segundos_a_mmss(t_inicio_raw)}"))
+    elif t_inicio_raw is not None and t_audio_ini is not None:
+        if t_audio_ini > t_inicio_raw + 30:
+            logs.append((
+                "aviso",
+                f"Inicio por frase ({segundos_a_mmss(t_inicio_raw)}) parece falso "
+                f"positivo; viento empieza en {segundos_a_mmss(t_audio_ini)} — corrigiendo"
+            ))
+            t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
+
+    # ─── FIN ───
+    # Si hay frase de llegada, SIEMPRE se respeta. El audio puede terminar el
+    # "wind block" prematuramente cuando el rider grita; eso cortaría antes de
+    # la llegada. La primera frase de llegada es la señal definitiva.
+    if t_fin_raw is None and t_audio_fin is not None:
+        t_fin_raw, texto_fin = t_audio_fin, "[audio]"
+        logs.append(("ok", f"Fin por audio: {segundos_a_mmss(t_fin_raw)}"))
+
+    # ─── SIN VUELO ───
+    # Casos: ni frase ni audio encontraron nada, o el bloque detectado es
+    # demasiado corto para ser un vuelo real (típicamente vídeo subido por error).
+    sin_vuelo = False
+    if t_inicio_raw is None and t_fin_raw is None:
+        sin_vuelo = True
+    elif t_inicio_raw is not None and t_fin_raw is not None:
+        if t_fin_raw - t_inicio_raw < 10:
+            sin_vuelo = True
+
+    # ─── MÁRGENES ───
+    if t_inicio_raw is not None:
+        t_inicio = max(0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
+    else:
+        t_inicio = 0.0
+
+    if t_fin_raw is not None:
+        t_fin = min(duracion, t_fin_raw + SEGUNDOS_DESPUES_FIN)
+    else:
+        t_fin = duracion
+
+    return {
+        "t_inicio": t_inicio,
+        "t_fin": t_fin,
+        "t_inicio_raw": t_inicio_raw,
+        "t_fin_raw": t_fin_raw,
+        "texto_inicio": texto_inicio,
+        "texto_fin": texto_fin,
+        "sin_vuelo": sin_vuelo,
+        "logs": logs,
+    }
+
+
 # ========== PROCESAMIENTO PRINCIPAL ==========
 def procesar_video(video_path, model):
     print_header(f"Procesando: {video_path.name}")
 
-    print("→ Extrayendo audio...")
-    audio_tmp = Path("_audio_tmp.wav")
-    extraer_audio(video_path, audio_tmp)
+    # Validación previa: detecta sin audio, placeholder OneDrive, corrupto, etc.
+    ok_val, motivo = validar_video(video_path)
+    if not ok_val:
+        print(f"  ⚠ {motivo}")
+        return False, motivo
 
-    duracion = obtener_duracion(video_path)
-
-    print("→ Transcribiendo audio con IA...")
-    transcripcion = transcribir_audio(audio_tmp, model)
-
-    # Guardar transcripción para debug
-    transcript_path = CARPETA_SALIDA / f"{video_path.stem}_transcripcion.txt"
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        for seg in transcripcion["segments"]:
-            f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
-
-    # Detectar puntos de corte (guardamos los valores raw antes de aplicar márgenes)
-    print("→ Buscando señal de salida y llegada...")
-    t_inicio_raw, texto_inicio = buscar_inicio(transcripcion, duracion)
-    t_fin_raw,    texto_fin    = buscar_fin(transcripcion, duracion)
-
-    # Análisis de audio — siempre, para validar y corregir la detección por frase
-    print("→ Analizando energía de audio...")
-    t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
-
-    _UMBRAL = 20  # seg; desacuerdo mayor → la frase es falso positivo
-
-    if t_inicio_raw is not None and t_audio_ini is not None:
-        if abs(t_inicio_raw - t_audio_ini) > _UMBRAL or t_audio_ini < t_inicio_raw:
-            print(f"  ⚠ Inicio por frase ({segundos_a_mmss(t_inicio_raw)}) "
-                  f"corregido por audio → {segundos_a_mmss(t_audio_ini)}")
-            t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
-    elif t_inicio_raw is None and t_audio_ini is not None:
-        t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
-        print(f"  ✓ Inicio por audio:  {segundos_a_mmss(t_inicio_raw)}")
-
-    if t_fin_raw is not None and t_audio_fin is not None:
-        if abs(t_fin_raw - t_audio_fin) > _UMBRAL or t_audio_fin > t_fin_raw:
-            print(f"  ⚠ Llegada por frase ({segundos_a_mmss(t_fin_raw)}) "
-                  f"corregida por audio → {segundos_a_mmss(t_audio_fin)}")
-            t_fin_raw, texto_fin = t_audio_fin, "[audio]"
-    elif t_fin_raw is None and t_audio_fin is not None:
-        t_fin_raw, texto_fin = t_audio_fin, "[audio]"
-        print(f"  ✓ Fin por audio:     {segundos_a_mmss(t_fin_raw)}")
-
-    # Aplicar márgenes
-    if t_inicio_raw is not None:
-        if texto_inicio != "[audio]":
-            print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(t_inicio_raw)}")
-        t_inicio = max(0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
-    else:
-        print("  ⚠ Inicio no detectado, empezando desde 0s")
-        t_inicio = 0
-
-    if t_fin_raw is not None:
-        if texto_fin != "[audio]":
-            print(f"  ✓ Llegada detectada: '{texto_fin.strip()}' → {segundos_a_mmss(t_fin_raw)}")
-        t_fin = min(duracion, t_fin_raw + SEGUNDOS_DESPUES_FIN)
-    else:
-        print("  ⚠ Fin no detectado, usando fin del clip")
-        print(f"    (revisa {transcript_path.name} para ver qué dijo el monitor)")
-        t_fin = duracion
-
-    # Confirmar con el usuario (solo en modo manual)
-    if not MODO_AUTO:
-        t_inicio, t_fin = confirmar_o_ajustar(t_inicio, t_fin, duracion, video_path)
-    else:
-        print(f"\n  Corte automático: {segundos_a_mmss(t_inicio)} → {segundos_a_mmss(t_fin)} ({t_fin - t_inicio:.0f}s)")
-
-    # Editar
-    print("→ Generando vídeo final (recorte + logo + compresión)...")
+    audio_tmp = audio_tmp_path()
     video_salida = CARPETA_SALIDA / f"{video_path.stem}_FINAL.mp4"
-    editar_video(video_path, t_inicio, t_fin, video_salida)
 
-    # Verificar resultado (multi-agente)
-    print("→ Verificando resultado...")
-    checks = verificar_corte(video_salida)
-    for nombre, chk_ok, det in checks:
-        print(f"  {'✓' if chk_ok else '⚠'} {nombre}: {det}")
-    ok     = all(chk_ok for _, chk_ok, _ in checks)
-    detalle = " | ".join(f"{n}:{d}" for n, chk_ok, d in checks if not chk_ok) or "OK"
+    try:
+        print("→ Extrayendo audio...")
+        extraer_audio(video_path, audio_tmp)
 
-    audio_tmp.unlink(missing_ok=True)
-    return ok, detalle
+        duracion = obtener_duracion(video_path)
+
+        print("→ Transcribiendo audio con IA...")
+        transcripcion = transcribir_audio(audio_tmp, model)
+
+        # Guardar transcripción para debug
+        transcript_path = CARPETA_SALIDA / f"{video_path.stem}_transcripcion.txt"
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            for seg in transcripcion["segments"]:
+                f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
+
+        # Detección de corte (lógica compartida con el GUI)
+        print("→ Buscando señal de salida y llegada y analizando audio...")
+        corte = resolver_corte(transcripcion, duracion, audio_tmp)
+        for nivel, msg in corte["logs"]:
+            prefijo = "  ⚠" if nivel == "aviso" else "  ✓"
+            print(f"{prefijo} {msg}")
+
+        # Caso "sin vuelo": no generar salida, devolver error claro.
+        if corte["sin_vuelo"]:
+            print("  ⚠ No se detectó ningún vuelo en este clip — saltando")
+            return False, "sin vuelo detectado (vídeo de instrucciones, prueba o subido por error)"
+
+        t_inicio, t_fin = corte["t_inicio"], corte["t_fin"]
+        texto_inicio, texto_fin = corte["texto_inicio"], corte["texto_fin"]
+
+        if corte["t_inicio_raw"] is not None and texto_inicio != "[audio]":
+            print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(corte['t_inicio_raw'])}")
+        elif corte["t_inicio_raw"] is None:
+            print("  ⚠ Inicio no detectado, empezando desde 0s")
+
+        if corte["t_fin_raw"] is not None and texto_fin != "[audio]":
+            print(f"  ✓ Llegada detectada: '{texto_fin.strip()}' → {segundos_a_mmss(corte['t_fin_raw'])}")
+        elif corte["t_fin_raw"] is None:
+            print("  ⚠ Fin no detectado, usando fin del clip")
+            print(f"    (revisa {transcript_path.name} para ver qué dijo el monitor)")
+
+        # Confirmar con el usuario (solo en modo manual)
+        if not MODO_AUTO:
+            t_inicio, t_fin = confirmar_o_ajustar(t_inicio, t_fin, duracion, video_path)
+        else:
+            print(f"\n  Corte automático: {segundos_a_mmss(t_inicio)} → {segundos_a_mmss(t_fin)} ({t_fin - t_inicio:.0f}s)")
+
+        # Editar — si falla a medias, borrar el MP4 parcial.
+        print("→ Generando vídeo final (recorte + logo + compresión)...")
+        try:
+            editar_video(video_path, t_inicio, t_fin, video_salida)
+        except Exception:
+            video_salida.unlink(missing_ok=True)
+            raise
+
+        # Verificar resultado (multi-agente)
+        print("→ Verificando resultado...")
+        checks = verificar_corte(video_salida)
+        for nombre, chk_ok, det in checks:
+            print(f"  {'✓' if chk_ok else '⚠'} {nombre}: {det}")
+        ok = all(chk_ok for _, chk_ok, _ in checks)
+        detalle = " | ".join(f"{n}:{d}" for n, chk_ok, d in checks if not chk_ok) or "OK"
+
+        return ok, detalle
+    finally:
+        # El audio temporal se borra siempre (atexit también lo cubre por si crashea).
+        audio_tmp.unlink(missing_ok=True)
 
 
 def main():
@@ -615,9 +890,12 @@ def main():
 
     print(f"\n→ Cargando IA de transcripción...")
     print("  (la primera vez tarda un poco, luego es rápido)")
-    import whisper
-    model = whisper.load_model(MODELO_WHISPER)
-    print("  ✓ Lista")
+    try:
+        model, _ = cargar_modelo_whisper()
+    except RuntimeError as e:
+        print(f"\n❌ {e}")
+        input("\n  Pulsa Enter para cerrar...")
+        sys.exit(1)
 
     resultados = []  # (nombre, ok, detalle)
     for i, video in enumerate(videos, 1):

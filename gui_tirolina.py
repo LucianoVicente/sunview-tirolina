@@ -25,10 +25,10 @@ except ImportError:
 
 from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
-    buscar_inicio, buscar_fin, detectar_vuelo_por_audio,
     editar_video, verificar_corte,
-    segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES, MODELO_WHISPER,
-    SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
+    validar_video, resolver_corte, audio_tmp_path,
+    cargar_modelo_whisper,
+    segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES,
     BUSCAR_INICIO_HASTA_PORCENTAJE,
 )
 
@@ -195,26 +195,39 @@ class App(BaseVentana):
                          daemon=True).start()
 
     def _worker(self, videos: list[Path]):
-        import whisper as _whisper
         self._log("Cargando modelo de IA...\n", "info")
         try:
-            model = _whisper.load_model(MODELO_WHISPER)
-        except Exception as exc:
-            self._log(f"Error cargando modelo: {exc}\n", "error")
+            def _log_modelo(nivel, msg):
+                self._log(f"  {msg}\n", nivel)
+            model, _ = cargar_modelo_whisper(log=_log_modelo)
+        except RuntimeError as exc:
+            self._log(f"{exc}\n", "error")
             self.cola.put(("fin", []))
             return
-        self._log("Modelo listo.\n\n", "info")
+        self._log("\n", "info")
 
         resultados = []
-        audio_tmp = Path("_audio_tmp.wav")
+        audio_tmp = audio_tmp_path()
 
         for i, video in enumerate(videos, 1):
             self.cola.put(("prog_label", f"[{i}/{len(videos)}] {video.name}"))
             self._log(f"{'─'*45}\n{video.name}\n", "header")
             duracion = 0
             t0, t1 = 0, 0
-            t0_raw, t1_raw = None, None
             salida = CARPETA_SALIDA / f"{video.stem}_FINAL.mp4"
+
+            # Validación previa: detecta sin audio, OneDrive placeholder, corrupto
+            ok_val, motivo = validar_video(video)
+            if not ok_val:
+                self._log(f"⚠ No se puede procesar: {motivo}\n\n", "error")
+                resultados.append({
+                    "nombre": video.name, "ok": False, "detalle": motivo,
+                    "necesita_ajuste": False, "video_path": video,
+                    "salida_path": salida, "duracion": 0, "t0": 0, "t1": 0,
+                })
+                self.cola.put(("prog_barra", i))
+                continue
+
             try:
                 self._log("Extrayendo audio...\n", "info")
                 extraer_audio(video, audio_tmp)
@@ -228,54 +241,46 @@ class App(BaseVentana):
                     for seg in tx["segments"]:
                         f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
 
-                t0_raw, txt0 = buscar_inicio(tx, duracion)
-                t1_raw, txt1 = buscar_fin(tx, duracion)
-
-                # Análisis de audio — siempre, para validar y corregir la detección por frase.
-                # El audio es más fiable para el timing exacto del vuelo; la frase puede
-                # aparecer durante la preparación (inicio falso temprano) o en pleno vuelo
-                # por radio/pasajero (fin falso prematuro).
                 self._log("Analizando energía de audio...\n", "info")
-                t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
+                # Lógica compartida con CLI — cualquier mejora se aplica aquí también.
+                corte = resolver_corte(tx, duracion, audio_tmp)
+                for nivel, msg in corte["logs"]:
+                    self._log(f"{msg}\n", nivel)
 
-                _UMBRAL = 20  # seg; desacuerdo mayor → la frase es falso positivo
+                # "Sin vuelo": no generar salida, pero ofrecer ajuste manual
+                if corte["sin_vuelo"]:
+                    self._log(
+                        "⚠ No se detectó ningún vuelo en este clip.\n"
+                        "  Si es un vídeo de instrucciones o prueba, ignóralo.\n"
+                        "  Si crees que sí hay vuelo, ajústalo manualmente abajo.\n\n",
+                        "aviso",
+                    )
+                    resultados.append({
+                        "nombre": video.name, "ok": False,
+                        "detalle": "sin vuelo detectado",
+                        "necesita_ajuste": True, "video_path": video,
+                        "salida_path": salida, "duracion": duracion,
+                        "t0": 0, "t1": duracion,
+                    })
+                    self.cola.put(("prog_barra", i))
+                    continue
 
-                # Resolver inicio: preferir audio si es más temprano o si discrepa mucho
-                if t0_raw is not None and t_audio_ini is not None:
-                    if abs(t0_raw - t_audio_ini) > _UMBRAL or t_audio_ini < t0_raw:
-                        t0_raw, txt0 = t_audio_ini, "[audio]"
-                elif t0_raw is None and t_audio_ini is not None:
-                    t0_raw, txt0 = t_audio_ini, "[audio]"
+                t0, t1 = corte["t_inicio"], corte["t_fin"]
+                t0_raw, t1_raw = corte["t_inicio_raw"], corte["t_fin_raw"]
+                txt0, txt1 = corte["texto_inicio"], corte["texto_fin"]
 
-                # Resolver fin: preferir audio si es más tardío o si discrepa mucho
-                if t1_raw is not None and t_audio_fin is not None:
-                    if abs(t1_raw - t_audio_fin) > _UMBRAL or t_audio_fin > t1_raw:
-                        t1_raw, txt1 = t_audio_fin, "[audio]"
-                elif t1_raw is None and t_audio_fin is not None:
-                    t1_raw, txt1 = t_audio_fin, "[audio]"
-
-                if t0_raw is not None:
-                    t0 = max(0, t0_raw - SEGUNDOS_ANTES_INICIO)
-                    if txt0 == "[audio]":
-                        self._log(f"✓ Salida (audio):  {segundos_a_mmss(t0_raw)}\n", "ok")
-                    else:
-                        self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
-                else:
-                    t0 = 0
+                if t0_raw is not None and txt0 != "[audio]":
+                    self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
+                elif t0_raw is None:
                     self._log("⚠ Inicio no detectado — lo que oyó Whisper al principio:\n", "aviso")
                     limite = duracion * BUSCAR_INICIO_HASTA_PORCENTAJE
                     segs = [s for s in tx["segments"] if s["start"] <= limite and s["text"].strip()]
                     for s in segs:
                         self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
 
-                if t1_raw is not None:
-                    t1 = min(duracion, t1_raw + SEGUNDOS_DESPUES_FIN)
-                    if txt1 == "[audio]":
-                        self._log(f"✓ Llegada (audio): {segundos_a_mmss(t1_raw)}\n", "ok")
-                    else:
-                        self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
-                else:
-                    t1 = duracion
+                if t1_raw is not None and txt1 != "[audio]":
+                    self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
+                elif t1_raw is None:
                     self._log("⚠ Llegada no detectada — lo que oyó Whisper al final:\n", "aviso")
                     limite_fin = duracion * 0.70
                     segs = [s for s in tx["segments"] if s["start"] >= limite_fin and s["text"].strip()]
@@ -289,7 +294,11 @@ class App(BaseVentana):
                           f"({t1 - t0:.0f}s)\n", "info")
 
                 self._log("Generando vídeo final...\n", "info")
-                editar_video(video, t0, t1, salida)
+                try:
+                    editar_video(video, t0, t1, salida)
+                except Exception:
+                    salida.unlink(missing_ok=True)
+                    raise
 
                 self._log("Verificando...\n", "info")
                 checks = verificar_corte(salida)
@@ -298,7 +307,7 @@ class App(BaseVentana):
                         f"  {'✓' if ch_ok else '⚠'} {ch_nombre}: {ch_det}\n",
                         "ok" if ch_ok else "aviso",
                     )
-                ok     = all(ch_ok for _, ch_ok, _ in checks)
+                ok = all(ch_ok for _, ch_ok, _ in checks)
                 detalle = (
                     " | ".join(f"{n}:{d}" for n, ch_ok, d in checks if not ch_ok)
                     or "OK"
@@ -332,6 +341,7 @@ class App(BaseVentana):
                     "t1": t1,
                 })
             finally:
+                # El audio temporal se borra entre vídeos; atexit cubre el cierre.
                 audio_tmp.unlink(missing_ok=True)
                 self.cola.put(("prog_barra", i))
 
