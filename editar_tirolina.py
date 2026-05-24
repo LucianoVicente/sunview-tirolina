@@ -526,18 +526,29 @@ def procesar_video(video_path, model):
     t_inicio_raw, texto_inicio = buscar_inicio(transcripcion, duracion)
     t_fin_raw,    texto_fin    = buscar_fin(transcripcion, duracion)
 
-    # Fallback de audio: si alguno no se detectó por transcripción, analizar el WAV
-    if t_inicio_raw is None or t_fin_raw is None:
-        print("→ Aplicando análisis de audio (energía de viento)...")
-        t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
-        if t_inicio_raw is None and t_audio_ini is not None:
-            t_inicio_raw  = t_audio_ini
-            texto_inicio  = "[audio]"
-            print(f"  ✓ Inicio por audio:  {segundos_a_mmss(t_inicio_raw)}")
-        if t_fin_raw is None and t_audio_fin is not None:
-            t_fin_raw   = t_audio_fin
-            texto_fin   = "[audio]"
-            print(f"  ✓ Fin por audio:     {segundos_a_mmss(t_fin_raw)}")
+    # Análisis de audio — siempre, para validar y corregir la detección por frase
+    print("→ Analizando energía de audio...")
+    t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
+
+    _UMBRAL = 20  # seg; desacuerdo mayor → la frase es falso positivo
+
+    if t_inicio_raw is not None and t_audio_ini is not None:
+        if abs(t_inicio_raw - t_audio_ini) > _UMBRAL or t_audio_ini < t_inicio_raw:
+            print(f"  ⚠ Inicio por frase ({segundos_a_mmss(t_inicio_raw)}) "
+                  f"corregido por audio → {segundos_a_mmss(t_audio_ini)}")
+            t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
+    elif t_inicio_raw is None and t_audio_ini is not None:
+        t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
+        print(f"  ✓ Inicio por audio:  {segundos_a_mmss(t_inicio_raw)}")
+
+    if t_fin_raw is not None and t_audio_fin is not None:
+        if abs(t_fin_raw - t_audio_fin) > _UMBRAL or t_audio_fin > t_fin_raw:
+            print(f"  ⚠ Llegada por frase ({segundos_a_mmss(t_fin_raw)}) "
+                  f"corregida por audio → {segundos_a_mmss(t_audio_fin)}")
+            t_fin_raw, texto_fin = t_audio_fin, "[audio]"
+    elif t_fin_raw is None and t_audio_fin is not None:
+        t_fin_raw, texto_fin = t_audio_fin, "[audio]"
+        print(f"  ✓ Fin por audio:     {segundos_a_mmss(t_fin_raw)}")
 
     # Aplicar márgenes
     if t_inicio_raw is not None:

@@ -231,14 +231,28 @@ class App(BaseVentana):
                 t0_raw, txt0 = buscar_inicio(tx, duracion)
                 t1_raw, txt1 = buscar_fin(tx, duracion)
 
-                # Fallback: análisis de energía de audio cuando la transcripción no detecta
-                if t0_raw is None or t1_raw is None:
-                    self._log("Analizando energía de audio...\n", "info")
-                    t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
-                    if t0_raw is None and t_audio_ini is not None:
+                # Análisis de audio — siempre, para validar y corregir la detección por frase.
+                # El audio es más fiable para el timing exacto del vuelo; la frase puede
+                # aparecer durante la preparación (inicio falso temprano) o en pleno vuelo
+                # por radio/pasajero (fin falso prematuro).
+                self._log("Analizando energía de audio...\n", "info")
+                t_audio_ini, t_audio_fin = detectar_vuelo_por_audio(audio_tmp, duracion)
+
+                _UMBRAL = 20  # seg; desacuerdo mayor → la frase es falso positivo
+
+                # Resolver inicio: preferir audio si es más temprano o si discrepa mucho
+                if t0_raw is not None and t_audio_ini is not None:
+                    if abs(t0_raw - t_audio_ini) > _UMBRAL or t_audio_ini < t0_raw:
                         t0_raw, txt0 = t_audio_ini, "[audio]"
-                    if t1_raw is None and t_audio_fin is not None:
+                elif t0_raw is None and t_audio_ini is not None:
+                    t0_raw, txt0 = t_audio_ini, "[audio]"
+
+                # Resolver fin: preferir audio si es más tardío o si discrepa mucho
+                if t1_raw is not None and t_audio_fin is not None:
+                    if abs(t1_raw - t_audio_fin) > _UMBRAL or t_audio_fin > t1_raw:
                         t1_raw, txt1 = t_audio_fin, "[audio]"
+                elif t1_raw is None and t_audio_fin is not None:
+                    t1_raw, txt1 = t_audio_fin, "[audio]"
 
                 if t0_raw is not None:
                     t0 = max(0, t0_raw - SEGUNDOS_ANTES_INICIO)
