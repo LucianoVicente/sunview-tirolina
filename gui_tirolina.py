@@ -60,8 +60,15 @@ class App(BaseVentana):
         self.cola: queue.Queue = queue.Queue()
         self.procesando = False
 
+        # Pre-carga del modelo Whisper en background: cuando la recepcionista
+        # arrastra el primer vídeo, el modelo ya está cargado (10-15 s ahorrados).
+        self._modelo = None
+        self._modelo_event = threading.Event()
+
         self._construir_ui()
         self._poll_cola()
+
+        threading.Thread(target=self._precargar_modelo, daemon=True).start()
 
     # ── UI ──────────────────────────────────────────────────────────────────
 
@@ -194,17 +201,36 @@ class App(BaseVentana):
                          args=(list(self.videos),),
                          daemon=True).start()
 
-    def _worker(self, videos: list[Path]):
-        self._log("Cargando modelo de IA...\n", "info")
+    def _precargar_modelo(self):
+        """Carga Whisper en background al abrir la app. Silencioso si triunfa;
+        si falla, _worker hará el segundo intento con log visible."""
         try:
-            def _log_modelo(nivel, msg):
-                self._log(f"  {msg}\n", nivel)
-            model, _ = cargar_modelo_whisper(log=_log_modelo)
-        except RuntimeError as exc:
-            self._log(f"{exc}\n", "error")
-            self.cola.put(("fin", []))
-            return
-        self._log("\n", "info")
+            self._modelo, _ = cargar_modelo_whisper()
+        except Exception:
+            self._modelo = None
+        finally:
+            self._modelo_event.set()
+
+    def _worker(self, videos: list[Path]):
+        # Esperar a que termine la pre-carga (suele estar ya lista).
+        if not self._modelo_event.is_set():
+            self._log("Cargando modelo de IA...\n", "info")
+            self._modelo_event.wait()
+
+        if self._modelo is None:
+            # La pre-carga falló: reintentar con log visible para diagnóstico.
+            self._log("Cargando modelo de IA...\n", "info")
+            try:
+                def _log_modelo(nivel, msg):
+                    self._log(f"  {msg}\n", nivel)
+                self._modelo, _ = cargar_modelo_whisper(log=_log_modelo)
+            except RuntimeError as exc:
+                self._log(f"{exc}\n", "error")
+                self.cola.put(("fin", []))
+                return
+            self._log("\n", "info")
+
+        model = self._modelo
 
         resultados = []
         audio_tmp = audio_tmp_path()
@@ -234,7 +260,14 @@ class App(BaseVentana):
                 duracion = obtener_duracion(video)
 
                 self._log("Transcribiendo con IA...\n", "info")
-                tx = transcribir_audio(audio_tmp, model)
+                # Callback de progreso: la transcripción es el paso más largo
+                # y sin feedback parece colgada. Muestra % en la etiqueta superior.
+                def _prog_transcripcion(pct, _texto):
+                    self.cola.put((
+                        "prog_label",
+                        f"[{i}/{len(videos)}] {video.name} — transcribiendo {pct}%",
+                    ))
+                tx = transcribir_audio(audio_tmp, model, on_segment=_prog_transcripcion)
 
                 txt_path = CARPETA_SALIDA / f"{video.stem}_transcripcion.txt"
                 with open(txt_path, "w", encoding="utf-8") as f:

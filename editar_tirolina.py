@@ -4,6 +4,7 @@ Sunview Park - Editor automático de vídeos de tirolina
 """
 
 import atexit
+import functools
 import os
 import subprocess
 import shutil
@@ -118,10 +119,46 @@ MODELOS_WHISPER_FALLBACK = ["small", "base", "tiny"]
 MODO_AUTO = True        # True = sin preguntas, procesa todo solo
 
 
+def _cuda_runtime_disponible():
+    """
+    Verifica que las DLLs runtime de CUDA (cuBLAS) están realmente cargables.
+    `get_cuda_device_count` solo mira el driver — no garantiza que las
+    librerías de runtime estén instaladas. Sin esta comprobación, faster-whisper
+    carga el modelo en GPU OK pero crashea en el primer encode con
+    "cublas64_12.dll not found".
+    """
+    if sys.platform != "win32":
+        # En Linux/macOS faster-whisper bundlea o usa rpath; con que get_cuda_device_count
+        # responda OK suele bastar.
+        return True
+    try:
+        import ctypes
+        ctypes.WinDLL("cublas64_12.dll")
+        return True
+    except OSError:
+        return False
+
+
+def _detectar_dispositivo_whisper():
+    """
+    Devuelve (device, compute_type) según hardware disponible.
+    - GPU NVIDIA con CUDA y DLLs runtime → cuda/float16 (~5× más rápido)
+    - Resto → cpu/int8 (2× más rápido que float32, mitad RAM)
+    """
+    try:
+        from ctranslate2 import get_cuda_device_count
+        if get_cuda_device_count() > 0 and _cuda_runtime_disponible():
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+
 def cargar_modelo_whisper(preferido=None, log=None):
     """
-    Carga el modelo Whisper más grande que quepa en memoria.
+    Carga el modelo faster-whisper más grande que quepa en memoria.
     Empieza por `preferido` (o MODELO_WHISPER) y degrada a base/tiny si OOM.
+    Auto-detecta GPU NVIDIA si está disponible; en su defecto, CPU int8.
 
     `log` es un callable opcional log(nivel, msg) — la GUI lo usa para mostrar
     qué modelo se cargó. Si es None, se imprime en consola.
@@ -129,7 +166,7 @@ def cargar_modelo_whisper(preferido=None, log=None):
     Devuelve (modelo, nombre_modelo_cargado).
     Lanza RuntimeError con todos los errores acumulados si ninguno carga.
     """
-    import whisper
+    from faster_whisper import WhisperModel
 
     def _say(nivel, msg):
         if log is not None:
@@ -137,22 +174,30 @@ def cargar_modelo_whisper(preferido=None, log=None):
         else:
             print(f"  {'⚠' if nivel == 'aviso' else '✓'} {msg}")
 
-    # Construir orden: empezar por el preferido, luego degradar.
     pref = preferido or MODELO_WHISPER
     orden = [pref] + [m for m in MODELOS_WHISPER_FALLBACK if m != pref]
 
+    # Probar primero GPU; si falla por falta de cuDNN/driver, degradar a CPU.
+    dispositivos = [_detectar_dispositivo_whisper()]
+    if dispositivos[0][0] == "cuda":
+        dispositivos.append(("cpu", "int8"))
+
     errores = []
-    for nombre in orden:
-        try:
-            modelo = whisper.load_model(nombre)
-            if nombre != pref:
-                _say("aviso", f"Modelo '{pref}' no cargó; usando '{nombre}' (menos preciso pero ligero)")
-            else:
-                _say("ok", f"Modelo Whisper '{nombre}' cargado")
-            return modelo, nombre
-        except (MemoryError, RuntimeError, OSError) as e:
-            errores.append(f"{nombre}: {type(e).__name__}: {e}")
-            continue
+    for device, compute_type in dispositivos:
+        for nombre in orden:
+            try:
+                modelo = WhisperModel(nombre, device=device, compute_type=compute_type)
+                etiqueta = f"{nombre} ({device}/{compute_type})"
+                if nombre != pref:
+                    _say("aviso", f"Modelo '{pref}' no cargó; usando '{etiqueta}'")
+                else:
+                    _say("ok", f"Modelo Whisper '{etiqueta}' cargado")
+                return modelo, nombre
+            except Exception as e:
+                errores.append(f"{nombre} en {device}: {type(e).__name__}: {e}")
+                continue
+        if device == "cuda":
+            _say("aviso", "GPU no utilizable — usando CPU")
 
     raise RuntimeError(
         "No se pudo cargar NINGÚN modelo Whisper. Revisa:\n"
@@ -181,10 +226,10 @@ def comprobar_dependencias():
         return False
     print("✓ FFprobe encontrado")
     try:
-        import whisper
-        print("✓ Whisper encontrado")
+        import faster_whisper  # noqa: F401
+        print("✓ faster-whisper encontrado")
     except ImportError:
-        print("❌ Whisper no instalado. Ejecuta: pip install openai-whisper")
+        print("❌ faster-whisper no instalado. Ejecuta: pip install faster-whisper")
         return False
     if not LOGO_PATH.exists():
         print(f"❌ Logo no encontrado en {LOGO_PATH}")
@@ -199,7 +244,11 @@ def extraer_audio(video_path, audio_path):
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         str(audio_path)
     ]
-    subprocess.run(cmd, capture_output=True, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg falló al extraer audio:\n{(result.stderr or '')[-500:]}"
+        )
 
 
 def obtener_duracion(video_path):
@@ -211,14 +260,47 @@ def obtener_duracion(video_path):
     return float(result.stdout.strip())
 
 
-def transcribir_audio(audio_path, model):
-    result = model.transcribe(
+# initial_prompt sesga a Whisper hacia el vocabulario esperado en la tirolina.
+# Reduce errores tipo "3, 2, 1" → "32 mil" o "qué tal" → "queta".
+_WHISPER_PROMPT = (
+    "Tres, dos, uno. ¡Buen vuelo! Disfruta del vuelo. Allá vamos. "
+    "¿Qué tal? ¿Cómo estás? ¡Bienvenido! ¡Madre mía! Sobrevivimos."
+)
+
+
+def transcribir_audio(audio_path, model, on_segment=None):
+    """
+    Transcribe el audio y devuelve {"segments": [{"start","end","text"}, ...]}.
+
+    `on_segment` (opcional): callable(pct:int, texto:str) que se llama al cerrar
+    cada segmento — la GUI lo usa para mostrar progreso de transcripción.
+    """
+    segments_gen, info = model.transcribe(
         str(audio_path),
         language="es",
-        verbose=None,
         temperature=0,
+        initial_prompt=_WHISPER_PROMPT,
+        # Evita que alucinaciones contaminen los siguientes segmentos
+        # (típico cuando hay viento sostenido).
+        condition_on_previous_text=False,
+        # VAD descarta silencio puro: 20-40 % menos tiempo en clips con largos
+        # tramos de viento sin voz, sin perder ninguna frase.
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
     )
-    return result
+
+    duracion = max(0.01, float(info.duration))
+    segments = []
+    for s in segments_gen:
+        segments.append({
+            "start": float(s.start),
+            "end": float(s.end),
+            "text": s.text,
+        })
+        if on_segment is not None:
+            pct = min(100, int(s.end / duracion * 100))
+            on_segment(pct, s.text)
+    return {"segments": segments}
 
 
 def _es_ruido_viento(texto: str) -> bool:
@@ -318,8 +400,10 @@ def buscar_fin(transcripcion, duracion):
 
 def _bloques_de_viento(audio_path):
     """
-    Analiza el audio y devuelve [(t_ini, t_fin), ...] con todos los bloques
-    de viento sostenido. Lista vacía si no se pudo leer o no hay viento.
+    Analiza el audio y devuelve [(t_ini, t_fin, energía_media), ...] con todos
+    los bloques de viento sostenido. La energía permite distinguir vuelo real
+    (viento fuerte) de ruido ambiente sostenido (CV bajo pero RMS medio).
+    Lista vacía si no se pudo leer o no hay viento.
     """
     import wave
     import numpy as np
@@ -351,12 +435,15 @@ def _bloques_de_viento(audio_path):
         for i in range(n)
     ])
 
-    # Viento = energía por encima del suelo (5 % del pico) Y baja variabilidad.
-    noise_floor = np.max(rms_s) * 0.05
+    # Viento = energía por encima del suelo Y baja variabilidad.
+    # 30 % del pico: el viento real de vuelo es el sonido MÁS FUERTE del clip.
+    # Cualquier cosa por debajo (voces, ventilación, ambiente) se descarta.
+    noise_floor = np.max(rms_s) * 0.30
     wind = (rms_s > noise_floor) & (cv < 0.50)
 
-    # Rellenar huecos de hasta 5 s (gritos del pasajero).
-    GAP = 20
+    # Gap fill de 2 s: rellena gritos puntuales del pasajero pero mantiene
+    # separado el pre-vuelo del vuelo real (antes 5 s los fusionaba).
+    GAP = 8
     wind_s = np.array([
         wind[max(0, i - GAP) : min(n, i + GAP + 1)].mean() >= 0.5
         for i in range(n)
@@ -373,27 +460,99 @@ def _bloques_de_viento(audio_path):
     if in_run:
         runs.append((start_run, n))
 
-    # Convertir a segundos y filtrar bloques cortos (<10 s ≠ vuelo real)
-    bloques = [
-        (a * HOP / sr, b * HOP / sr)
-        for a, b in runs
-        if (b - a) * HOP / sr >= 10
-    ]
+    # Convertir a segundos + energía media. Filtrar bloques <10 s (no son vuelo).
+    bloques = []
+    for a, b in runs:
+        dur = (b - a) * HOP / sr
+        if dur < 10:
+            continue
+        mean_rms = float(rms_s[a:b].mean())
+        bloques.append((a * HOP / sr, b * HOP / sr, mean_rms))
     return bloques
+
+
+def _bloque_principal(bloques):
+    """
+    Elige el bloque de vuelo real por ENERGÍA (mean_rms × duración).
+    Pre-vuelo con ruido sostenido puede durar más que el vuelo real, pero
+    el vuelo tiene más energía. Devuelve (t_ini, t_fin) o None.
+    """
+    if not bloques:
+        return None
+    mejor = max(bloques, key=lambda b: b[2] * (b[1] - b[0]))
+    return mejor[0], mejor[1]
+
+
+def _detectar_onset_lanzamiento(audio_path):
+    """
+    Encuentra el momento de mayor SUBIDA SOSTENIDA de RMS — típicamente
+    el lanzamiento del rider (transición ambiente quieto → viento fuerte
+    cuando lo sueltan). Es la señal física más directa del momento del salto.
+
+    Devuelve t_inicio en segundos o None si no hay un onset claro.
+    Sólo debe usarse como REFINAMIENTO del inicio ya derivado del fin:
+    nunca para detección primaria (un grito en plataforma puede tener un
+    salto de RMS similar al lanzamiento real).
+    """
+    import wave
+    import numpy as np
+
+    try:
+        with wave.open(str(audio_path), "rb") as wf:
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return None
+
+    y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    HOP = int(sr * 0.5)
+    n = max(1, len(y) // HOP)
+    if n < 20:
+        return None
+
+    rms = np.array([
+        np.sqrt(np.mean(y[i*HOP : (i+1)*HOP] ** 2))
+        for i in range(n)
+    ])
+
+    K = 6   # ventana de 3 s antes y después
+    if n < 2 * K + 1:
+        return None
+
+    # En cada índice válido, "salto" = media(3 s siguientes) − media(3 s anteriores).
+    # El mayor salto positivo es el onset más fuerte del clip.
+    saltos = np.full(n, -np.inf)
+    for i in range(K, n - K):
+        saltos[i] = rms[i:i + K].mean() - rms[i - K:i].mean()
+
+    mejor_idx = int(np.argmax(saltos))
+
+    # Criterios de robustez:
+    #   - salto absoluto > 0.02 (no ruido)
+    #   - ratio después/antes ≥ 1.8x (transición clara, no fluctuación)
+    if saltos[mejor_idx] < 0.02:
+        return None
+    rms_antes  = rms[mejor_idx - K : mejor_idx].mean()
+    rms_despues = rms[mejor_idx : mejor_idx + K].mean()
+    if rms_antes < 1e-6 or rms_despues / rms_antes < 1.8:
+        return None
+
+    return mejor_idx * HOP / sr
 
 
 def detectar_vuelo_por_audio(audio_path, duracion):
     """
     Detecta inicio y fin del vuelo analizando el audio crudo, sin depender
-    de lo que diga el monitor. El vuelo = bloque más largo de viento sostenido.
+    de lo que diga el monitor. El vuelo = bloque de viento con más ENERGÍA
+    (no el más largo: pre-vuelo ambiente puede durar más pero ser más flojo).
     Funciona con cualquier idioma, monitor o parque.
     Devuelve (t_inicio, t_fin) en segundos, o (None, None).
     """
     bloques = _bloques_de_viento(audio_path)
-    if not bloques:
+    principal = _bloque_principal(bloques)
+    if principal is None:
         return None, None
-    best = max(bloques, key=lambda b: b[1] - b[0])
-    return best
+    return principal
 
 
 def detectar_multiples_vuelos(audio_path, separacion_min=15):
@@ -406,7 +565,7 @@ def detectar_multiples_vuelos(audio_path, separacion_min=15):
     if len(bloques) < 2:
         return False
     bloques = sorted(bloques)
-    for (_, fin1), (ini2, _) in zip(bloques, bloques[1:]):
+    for (_, fin1, _), (ini2, _, _) in zip(bloques, bloques[1:]):
         if ini2 - fin1 >= separacion_min:
             return True
     return False
@@ -452,29 +611,121 @@ def confirmar_o_ajustar(inicio, fin, duracion, video_path):
                 subprocess.run(["xdg-open", str(video_path)])
 
 
+# Cache mutable: una vez NVENC falla en runtime, no volver a intentarlo en la sesión.
+_NVENC_DISPONIBLE = None  # None = no probado, True/False = resultado
+
+
+def _tiene_nvenc():
+    """True si ffmpeg lista h264_nvenc y no ha fallado previamente en esta sesión."""
+    global _NVENC_DISPONIBLE
+    if _NVENC_DISPONIBLE is not None:
+        return _NVENC_DISPONIBLE
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        _NVENC_DISPONIBLE = "h264_nvenc" in out
+    except Exception:
+        _NVENC_DISPONIBLE = False
+    return _NVENC_DISPONIBLE
+
+
+def _construir_cmd_edicion(video_entrada, inicio, duracion_corte, video_salida, usar_gpu):
+    """Construye el comando ffmpeg para recortar + logo + comprimir.
+
+    Flags defensivos para GoPro:
+    - `-fflags +genpts` regenera timestamps (PTS no monotónicos por GPMD).
+    - `-avoid_negative_ts make_zero` evita timestamps negativos tras el seek.
+    - `[0:v:0]` selecciona la primera pista de vídeo (ignora GPMD/timecode).
+    - `force_divisible_by=2` en scale: H.264 exige dimensiones pares; sin esto
+      cierto contenido GoPro produce 1920x1081 y libx264 lo rechaza.
+    - Logo con `-2` (no `-1`): asegura altura par también en el overlay.
+    - `setsar=1` y `format=yuv420p` para pixel format compatible universal.
+    - NO usar -noautorotate: GoPro graba en orientación variable y los
+      metadatos de rotación son legítimos; sin autorotate sale invertido.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-ss", str(inicio),
+        "-i", str(video_entrada),
+        "-i", str(LOGO_PATH),
+        "-t", str(duracion_corte),
+        "-avoid_negative_ts", "make_zero",
+        "-filter_complex",
+        f"[1:v]scale=iw*{LOGO_ESCALA}:-2[logo];"
+        f"[0:v:0]scale={RESOLUCION}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"pad={RESOLUCION}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v];"
+        f"[v][logo]overlay=W-w-{LOGO_MARGEN}:{LOGO_MARGEN},format=yuv420p[outv]",
+        "-map", "[outv]",
+        "-map", "0:a:0?",   # primera pista de audio (opcional con '?')
+    ]
+    if usar_gpu:
+        # NVENC -cq ≈ libx264 -crf pero escala distinta: +4 da calidad equivalente.
+        cmd += [
+            "-c:v", "h264_nvenc", "-preset", "p5",
+            "-cq", str(CRF + 4), "-b:v", "0",
+        ]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF)]
+    cmd += [
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(video_salida),
+    ]
+    return cmd
+
+
 def editar_video(video_entrada, inicio, fin, video_salida):
+    """
+    Edita el vídeo intentando primero NVENC (GPU) y cayendo a libx264 si falla.
+    NVENC puede estar presente en ffmpeg pero fallar en runtime por driver
+    viejo, GPU incompatible, o formato GoPro raro. El fallback es transparente.
+    """
+    global _NVENC_DISPONIBLE
+
     duracion_corte = fin - inicio
     if duracion_corte <= 0:
         raise ValueError(
             f"duración de corte inválida (inicio={inicio:.1f}s, fin={fin:.1f}s)"
         )
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(inicio),
-        "-i", str(video_entrada),
-        "-i", str(LOGO_PATH),
-        "-t", str(duracion_corte),
-        "-filter_complex",
-        f"[1:v]scale=iw*{LOGO_ESCALA}:-1[logo];"
-        f"[0:v]scale={RESOLUCION}:force_original_aspect_ratio=decrease,"
-        f"pad={RESOLUCION}:(ow-iw)/2:(oh-ih)/2[v];"
-        f"[v][logo]overlay=W-w-{LOGO_MARGEN}:{LOGO_MARGEN}",
-        "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF),
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(video_salida)
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
+
+    intentos = [True, False] if _tiene_nvenc() else [False]
+    ultimo_stderr = ""
+    ultimo_cmd = []
+
+    for usar_gpu in intentos:
+        cmd = _construir_cmd_edicion(
+            video_entrada, inicio, duracion_corte, video_salida, usar_gpu
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        ultimo_stderr = result.stderr or ""
+        ultimo_cmd = cmd
+        # Limpiar fichero parcial antes del siguiente intento.
+        Path(video_salida).unlink(missing_ok=True)
+        if usar_gpu:
+            # NVENC falló: marcar como no disponible para los siguientes vídeos.
+            _NVENC_DISPONIBLE = False
+
+    # Volcar diagnóstico completo a un log junto al vídeo de salida.
+    # Útil para enviar el log si hay que diagnosticar fallos puntuales.
+    log_path = Path(video_salida).with_suffix(".ffmpeg_error.log")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Comando ejecutado:\n")
+            f.write(" ".join(f'"{a}"' if " " in str(a) else str(a) for a in ultimo_cmd))
+            f.write("\n\nSTDERR completo:\n")
+            f.write(ultimo_stderr)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"ffmpeg falló al editar el vídeo (ver {log_path.name} para detalles):\n"
+        f"{ultimo_stderr[-1500:]}"
+    )
 
 
 # ========== VERIFICACIÓN MULTI-AGENTE ==========
@@ -581,13 +832,16 @@ def verificar_llegada_detectada(video_path):
     """
     Los últimos 5s deben tener voz (energía variable).
     Ruido constante = aún en vuelo. Silencio = corte antes de la llegada.
+
+    Umbral CV 0.25 (no 0.30): en clips multi-vuelo el viento del siguiente
+    rider puede solapar con el final y bajar la variabilidad sin que sea fallo.
     """
     try:
         dur = obtener_duracion(video_path)
         rms, cv = _wav_rms_cv(video_path, ss=max(0, dur - 5))
         if rms < 0.005:
             return False, "final silencioso — corte antes de la llegada"
-        if cv < 0.30:
+        if cv < 0.25:
             return False, f"final con ruido constante (CV={cv:.2f}) — vuelo sin llegada capturada"
         return True, f"voz detectada (CV={cv:.2f})"
     except Exception as e:
@@ -622,6 +876,35 @@ def verificar_corte(video_path, *_args, **_kwargs):
 
 
 # ========== VALIDACIÓN PREVIA ==========
+def _es_placeholder_onedrive(video_path):
+    """
+    Detecta archivos OneDrive "files on demand" (icono de nube): el archivo
+    existe en el explorador con su tamaño completo, pero el contenido no
+    está descargado. Cualquier intento de leer dispararía una descarga lenta
+    o un fallo, según política de OneDrive.
+
+    Windows marca estos archivos con FILE_ATTRIBUTE_OFFLINE o reparse points
+    de tipo RECALL_*. Detectarlos por atributo es más fiable que por tamaño.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(video_path))
+        if attrs == -1:  # INVALID_FILE_ATTRIBUTES
+            return False
+        FILE_ATTRIBUTE_OFFLINE              = 0x1000
+        FILE_ATTRIBUTE_RECALL_ON_OPEN       = 0x40000
+        FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+        return bool(attrs & (
+            FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        ))
+    except Exception:
+        return False
+
+
 def validar_video(video_path):
     """
     Comprobaciones tempranas antes de procesar.
@@ -634,14 +917,20 @@ def validar_video(video_path):
     if not video_path.exists():
         return False, "no encontrado"
 
-    # OneDrive guarda placeholders de pocos bytes para archivos no descargados.
-    # Cualquier vídeo real pesa muchísimo más que 1 KB.
+    # OneDrive: archivos "files on demand" no descargados.
+    # Detectar por atributo de Windows ANTES de leer tamaño/llamar a ffprobe.
+    if _es_placeholder_onedrive(video_path):
+        return False, (
+            "archivo en la nube sin descargar — "
+            "abre OneDrive, click derecho → 'Mantener siempre en este dispositivo'"
+        )
+
     try:
         size = video_path.stat().st_size
     except OSError as e:
         return False, f"no se puede leer: {e}"
     if size < 1024:
-        return False, "archivo vacío o sin descargar (placeholder de OneDrive)"
+        return False, "archivo vacío o truncado"
 
     # ffprobe valida formato y presencia de pista de audio/vídeo.
     if not shutil.which("ffprobe"):
@@ -655,17 +944,33 @@ def validar_video(video_path):
             capture_output=True, text=True, timeout=30,
         )
     except subprocess.TimeoutExpired:
-        return False, "ffprobe se colgó leyendo el archivo (posible corrupción)"
+        return False, "ffprobe se colgó leyendo el archivo (posible corrupción o cloud-only)"
     except Exception as e:
         return False, f"error al validar: {e}"
 
     if result.returncode != 0:
         msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "formato no reconocido"
-        return False, f"no es un vídeo válido ({msg[:80]})"
+        return False, f"no es un vídeo válido ({msg[:120]})"
 
-    codecs = [c for c in result.stdout.strip().splitlines() if c]
+    # ffprobe CSV puede meter comas trailing en algunos streams (GoPro tiene
+    # streams de timecode/metadatos que salen como "video," "data,"). Tomamos
+    # solo el primer campo de cada línea, ignorando comas y espacios.
+    codecs = []
+    for linea in result.stdout.strip().splitlines():
+        valor = linea.split(",")[0].strip().lower()
+        if valor:
+            codecs.append(valor)
+
+    # Si ffprobe no devuelve NINGÚN stream pero el returncode es 0,
+    # casi siempre es un placeholder cloud-only que no detectamos antes,
+    # o un archivo recortado/corrupto.
+    if not codecs:
+        stderr_resumen = (result.stderr or "").strip().splitlines()
+        pista = stderr_resumen[-1][:120] if stderr_resumen else "sin streams legibles"
+        return False, f"archivo ilegible (¿OneDrive sin sincronizar?): {pista}"
+
     if "video" not in codecs:
-        return False, "no tiene pista de vídeo"
+        return False, f"no tiene pista de vídeo (codecs detectados: {', '.join(codecs)})"
     if "audio" not in codecs:
         return False, "sin pista de audio (cámara con micrófono apagado)"
 
@@ -701,59 +1006,179 @@ def _limpiar_audio_tmp():
 # Esta función es la ÚNICA fuente de verdad para decidir t_inicio/t_fin.
 # Tanto CLI (procesar_video) como GUI (gui_tirolina._worker) la usan.
 # Cualquier cambio en la lógica de detección se aplica automáticamente a ambos flujos.
+
+# El FIN (llegada) es la señal más fiable: frases muy distintivas
+# ("qué tal", "madre mía") + la GoPro se para poco después de llegar.
+# Estrategia: detectamos el fin (frase o caída del viento) y derivamos el
+# inicio restando la DURACION_VUELO_TIPICA_S. Lo que sobre delante del salto
+# es pre-vuelo (rider en plataforma) — irrelevante para el clip final.
+#
+# 80 s = max observado en cortes correctos del usuario (69-88 s, media 77 s)
+# con un poco de margen para no recortar dentro del vuelo.
+DURACION_VUELO_TIPICA_S = 80
+
+TOL_FIN_VS_VIENTO_S    = 15   # frase de llegada >15 s tras el fin del viento = post-charla, no llegada
+VENTANA_BUSQUEDA_LLEGADA_S = 20  # al recortar llegada tardía, buscar en los primeros 20 s tras el viento
+TOL_FIN_DENTRO_VIENTO_S = 10  # frase de llegada >10 s antes del fin del viento = exclamación mid-flight
+
+
+def _primera_frase_llegada(segments, desde, hasta):
+    """Primera frase de PALABRAS_FIN dentro del intervalo [desde, hasta], o None."""
+    for s in segments:
+        if s["start"] < desde:
+            continue
+        if s["start"] > hasta:
+            break
+        texto = s["text"].lower().strip()
+        for palabra in PALABRAS_FIN:
+            if palabra in texto:
+                return s["start"], s["text"]
+    return None
+
+
 def resolver_corte(transcripcion, duracion, audio_path):
     """
-    Combina detección por frase + audio para devolver el corte final.
+    Estrategia fin-ancla:
+      1) Detectar el FIN (señal más fiable: frase de llegada o caída del viento).
+         Frases "¿qué tal?" / "¡madre mía!" son muy distintivas y la GoPro
+         se para poco después de llegar → el final del clip es confiable.
+      2) Derivar el INICIO restando DURACION_VUELO_TIPICA_S al fin.
+         Lo que sobre por delante del salto es pre-vuelo (rider en plataforma)
+         y no molesta. Lo que NO podemos permitirnos es cortar dentro del vuelo.
+      3) La cuenta atrás detectada por Whisper se ignora para el corte
+         (se loguea sólo como referencia) — es demasiado poco fiable
+         (monitor cuenta pronto, presenta riders, etc.).
 
     Devuelve dict:
       t_inicio, t_fin              — segundos absolutos con márgenes aplicados
       t_inicio_raw, t_fin_raw      — segundos sin márgenes (None si no detectado)
-      texto_inicio, texto_fin      — frase que disparó la detección, o "[audio]"
-      sin_vuelo                    — True si ni frase ni audio detectaron un vuelo
-      logs                         — lista de (nivel, mensaje) para que el caller imprima/loguee
+      texto_inicio, texto_fin      — origen del timestamp ("[fin - 80s]", "[audio]", o frase)
+      sin_vuelo                    — True si no se pudo detectar ningún fin
+      logs                         — lista de (nivel, mensaje) para que el caller imprima
     """
-    t_inicio_raw, texto_inicio = buscar_inicio(transcripcion, duracion)
-    t_fin_raw,    texto_fin    = buscar_fin(transcripcion, duracion)
-    t_audio_ini, t_audio_fin   = detectar_vuelo_por_audio(audio_path, duracion)
+    # Detección (sin decidir aún quién manda).
+    t_inicio_frase, texto_inicio_frase = buscar_inicio(transcripcion, duracion)
+    t_fin_raw,      texto_fin          = buscar_fin(transcripcion, duracion)
+
+    bloques = _bloques_de_viento(audio_path)
+    principal = _bloque_principal(bloques)
+    if principal is not None:
+        v_ini, v_fin = principal
+    else:
+        v_ini = v_fin = None
 
     logs: list[tuple[str, str]] = []
 
-    # Aviso multi-vuelo: si hay 2+ vuelos en el clip, advertir.
-    # No intentamos auto-split (mantenemos el corte del bloque más largo).
     if detectar_multiples_vuelos(audio_path):
         logs.append((
             "aviso",
             "Se detectaron 2 o más vuelos en este clip — "
-            "se cortará solo el más largo. Si necesitas los otros, "
+            "se cortará solo el más energético. Si necesitas los otros, "
             "ajústalo a mano."
         ))
 
-    # ─── INICIO ───
-    # Solo aceptamos el override de audio cuando la frase está muy lejos del
-    # viento real (>30 s) — claro falso positivo (saludo/instrucciones).
-    if t_inicio_raw is None and t_audio_ini is not None:
-        t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
-        logs.append(("ok", f"Inicio por audio: {segundos_a_mmss(t_inicio_raw)}"))
-    elif t_inicio_raw is not None and t_audio_ini is not None:
-        if t_audio_ini > t_inicio_raw + 30:
+    # ─── FIN: la señal ancla ───
+    # Prioridad: 1) frase de llegada cercana al fin del viento;
+    #            2) fin del bloque de viento;
+    #            3) frase de llegada aislada.
+    if v_fin is not None:
+        if t_fin_raw is None:
+            t_fin_raw, texto_fin = v_fin, "[audio]"
+            logs.append(("ok", f"Fin por audio (caída del viento): {segundos_a_mmss(v_fin)}"))
+        elif v_ini is not None and t_fin_raw < v_ini:
             logs.append((
                 "aviso",
-                f"Inicio por frase ({segundos_a_mmss(t_inicio_raw)}) parece falso "
-                f"positivo; viento empieza en {segundos_a_mmss(t_audio_ini)} — corrigiendo"
+                f"Frase de llegada ({segundos_a_mmss(t_fin_raw)}) cae ANTES del "
+                f"vuelo ({segundos_a_mmss(v_ini)}) — falso positivo, usando audio"
             ))
-            t_inicio_raw, texto_inicio = t_audio_ini, "[audio]"
+            t_fin_raw, texto_fin = v_fin, "[audio]"
+        elif t_fin_raw < v_fin - TOL_FIN_DENTRO_VIENTO_S:
+            # La frase cae bien dentro del bloque de vuelo: típicamente una
+            # exclamación del rider mid-flight ("¡madre mía!", "wow") que
+            # Whisper transcribió como llegada. La llegada real es el fin del
+            # viento (cuando deja de soplar al frenar).
+            logs.append((
+                "aviso",
+                f"Frase de llegada ({segundos_a_mmss(t_fin_raw)}) cae dentro del "
+                f"vuelo (Δ={v_fin - t_fin_raw:.0f}s antes del fin del viento) "
+                f"— exclamación mid-flight, usando audio"
+            ))
+            t_fin_raw, texto_fin = v_fin, "[audio]"
+        elif t_fin_raw > v_fin + TOL_FIN_VS_VIENTO_S:
+            mejor = _primera_frase_llegada(
+                transcripcion["segments"],
+                desde=v_fin - 5,
+                hasta=v_fin + VENTANA_BUSQUEDA_LLEGADA_S,
+            )
+            if mejor is not None:
+                logs.append((
+                    "aviso",
+                    f"Frase de llegada muy tardía ({segundos_a_mmss(t_fin_raw)}); "
+                    f"usando primera frase tras el vuelo: {segundos_a_mmss(mejor[0])}"
+                ))
+                t_fin_raw, texto_fin = mejor
+            else:
+                logs.append((
+                    "aviso",
+                    f"Frase de llegada muy tardía ({segundos_a_mmss(t_fin_raw)}); "
+                    f"sin alternativa cerca del fin del viento — usando audio"
+                ))
+                t_fin_raw, texto_fin = v_fin, "[audio]"
 
-    # ─── FIN ───
-    # Si hay frase de llegada, SIEMPRE se respeta. El audio puede terminar el
-    # "wind block" prematuramente cuando el rider grita; eso cortaría antes de
-    # la llegada. La primera frase de llegada es la señal definitiva.
-    if t_fin_raw is None and t_audio_fin is not None:
-        t_fin_raw, texto_fin = t_audio_fin, "[audio]"
-        logs.append(("ok", f"Fin por audio: {segundos_a_mmss(t_fin_raw)}"))
+    # ─── INICIO: derivado del fin, refinado por onset de audio ───
+    if t_fin_raw is not None:
+        t_inicio_raw = max(0, t_fin_raw - DURACION_VUELO_TIPICA_S)
+        texto_inicio = f"[fin − {DURACION_VUELO_TIPICA_S}s]"
+        logs.append((
+            "ok",
+            f"Inicio derivado: {segundos_a_mmss(t_fin_raw)} − {DURACION_VUELO_TIPICA_S}s "
+            f"= {segundos_a_mmss(t_inicio_raw)}"
+        ))
+
+        # Refinamiento: si hay un onset de audio claro (transición brusca de
+        # ambiente a viento) entre el inicio derivado y t_fin − 30 s, ese es
+        # el momento real del lanzamiento. Lo usamos sólo si MEJORA el inicio
+        # en al menos 3 s (lo apretamos hacia el salto real) y NUNCA puede
+        # cortar dentro del vuelo (rango limitado por t_fin − 30).
+        onset = _detectar_onset_lanzamiento(audio_path)
+        if onset is not None and t_inicio_raw <= onset <= t_fin_raw - 30:
+            if onset - t_inicio_raw >= 3:
+                logs.append((
+                    "ok",
+                    f"Lanzamiento detectado por audio en {segundos_a_mmss(onset)} "
+                    f"— refinando inicio desde {segundos_a_mmss(t_inicio_raw)}"
+                ))
+                t_inicio_raw = onset
+                texto_inicio = "[onset audio]"
+
+        # La frase de cuenta atrás, si se detectó, se reporta sólo como referencia.
+        if t_inicio_frase is not None:
+            logs.append((
+                "ok",
+                f"(cuenta atrás detectada en {segundos_a_mmss(t_inicio_frase)} "
+                f"— no se usa para el corte)"
+            ))
+    else:
+        # Sin fin fiable: último recurso, usar frase o viento de inicio.
+        if t_inicio_frase is not None:
+            t_inicio_raw, texto_inicio = t_inicio_frase, texto_inicio_frase
+            logs.append((
+                "aviso",
+                f"Sin fin fiable — usando frase de cuenta atrás como inicio: "
+                f"{segundos_a_mmss(t_inicio_frase)}"
+            ))
+        elif v_ini is not None:
+            t_inicio_raw, texto_inicio = v_ini, "[audio]"
+            logs.append((
+                "aviso",
+                f"Sin fin fiable — usando inicio del viento: {segundos_a_mmss(v_ini)}"
+            ))
+        else:
+            t_inicio_raw, texto_inicio = None, None
 
     # ─── SIN VUELO ───
-    # Casos: ni frase ni audio encontraron nada, o el bloque detectado es
-    # demasiado corto para ser un vuelo real (típicamente vídeo subido por error).
+    # No hay fin Y no hay ningún inicio reconocible → vídeo de instrucciones,
+    # prueba o subido por error.
     sin_vuelo = False
     if t_inicio_raw is None and t_fin_raw is None:
         sin_vuelo = True

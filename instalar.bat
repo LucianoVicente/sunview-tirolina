@@ -54,6 +54,13 @@ if not exist ".venv" (
 )
 echo [OK] Entorno virtual listo
 
+REM Limpiar instalacion previa de openai-whisper si existe (migracion a faster-whisper)
+.venv\Scripts\pip show openai-whisper >nul 2>&1
+if not errorlevel 1 (
+    echo Eliminando openai-whisper antiguo...
+    .venv\Scripts\pip uninstall -y openai-whisper --quiet
+)
+
 REM Instalar dependencias
 echo.
 echo Instalando dependencias (puede tardar unos minutos)...
@@ -66,10 +73,10 @@ if errorlevel 1 (
 )
 echo [OK] Dependencias instaladas
 
-REM Descargar modelo Whisper
+REM Descargar modelo Whisper (faster-whisper lo cachea en %LOCALAPPDATA%\huggingface)
 echo.
-echo Descargando modelo de IA (primera vez ~240 MB, luego no hace falta)...
-.venv\Scripts\python -c "import whisper; whisper.load_model('small'); print('[OK] Modelo de IA listo')"
+echo Descargando modelo de IA (primera vez ~500 MB, luego no hace falta)...
+.venv\Scripts\python -c "from faster_whisper import WhisperModel; WhisperModel('small'); print('[OK] Modelo de IA listo')"
 if errorlevel 1 (
     echo [AVISO] No se descargo el modelo ahora. Se descargara la primera vez que uses el programa.
 )
