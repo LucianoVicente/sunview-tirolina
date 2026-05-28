@@ -21,6 +21,9 @@ _audio_tmp.wav
 _check_inicio.wav
 _check_fin.wav
 
+# Historial dinámico de duraciones de vuelo (se va aprendiendo de cada parque)
+historial_vuelos.json
+
 # Cache de Python
 __pycache__/
 *.pyc

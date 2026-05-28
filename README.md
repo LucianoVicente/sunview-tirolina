@@ -90,7 +90,7 @@ Si `t_inicio` o `t_fin` son `None` (no detectados), el vídeo se procesa igualme
 | `MODELO_WHISPER` | `"small"` | `tiny`/`base`/`small`/`medium` — más grande = más preciso pero más lento |
 | `SEGUNDOS_ANTES_INICIO` | `1.5` | Margen antes del "3, 2, 1" |
 | `SEGUNDOS_DESPUES_FIN` | `2.0` | Margen después de la pregunta de llegada |
-| `BUSCAR_INICIO_HASTA_PORCENTAJE` | `0.55` | Límite del vídeo donde se busca la cuenta atrás |
+| `DURACION_VUELO_TIPICA_S` | `80` | Duración típica del vuelo — el inicio se ancla al fin restando este valor |
 | `PALABRAS_INICIO` | lista | Frases que indican salida |
 | `PALABRAS_FIN` | lista | Frases que indican llegada |
 | `RESOLUCION` | `"1920:1080"` | Resolución de salida |

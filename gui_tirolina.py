@@ -3,7 +3,7 @@ Sunview Park — Interfaz gráfica para edición de vídeos de tirolina
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
 import os
@@ -11,11 +11,27 @@ import sys
 from pathlib import Path
 
 # pythonw.exe no tiene consola — algunas librerías (tqdm, whisper) fallan
-# al escribir en sys.stdout/stderr si son None
+# al escribir en sys.stdout/stderr si son None. Mantenemos referencia a los
+# handles para cerrarlos al salir y no fugar descriptores.
+import atexit as _atexit  # alias local para no chocar con otros imports
+_DEVNULL_HANDLES = []
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
+    _h = open(os.devnull, "w")
+    _DEVNULL_HANDLES.append(_h)
+    sys.stdout = _h
 if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+    _h = open(os.devnull, "w")
+    _DEVNULL_HANDLES.append(_h)
+    sys.stderr = _h
+
+
+@_atexit.register
+def _cerrar_devnull():
+    for h in _DEVNULL_HANDLES:
+        try:
+            h.close()
+        except OSError:
+            pass
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -26,10 +42,11 @@ except ImportError:
 from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
     editar_video, verificar_corte,
-    validar_video, resolver_corte, audio_tmp_path,
+    validar_video, resolver_corte, audio_temp_file,
     cargar_modelo_whisper,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES,
-    BUSCAR_INICIO_HASTA_PORCENTAJE,
+    borrar_historial_duraciones, _cargar_historial_duraciones,
+    HISTORIAL_VUELOS_FILE,
 )
 
 COLORES = {
@@ -147,6 +164,21 @@ class App(BaseVentana):
                                       relief="flat", padx=16, pady=8,
                                       cursor="hand2", command=self._abrir_carpeta)
 
+        # Footer discreto con utilidad de mantenimiento. Bajo perfil a propósito:
+        # la recepcionista no debe pulsarlo a diario; sólo cuando alguien técnico
+        # sospecha que el historial está envenenado.
+        self.frame_footer = tk.Frame(self.cuerpo, bg=COLORES["fondo"])
+        self.frame_footer.pack(side="bottom", fill="x", pady=(8, 0))
+        self.lbl_borrar_historial = tk.Label(
+            self.frame_footer,
+            text="Borrar historial de duraciones",
+            font=(FUENTE, 8, "underline"),
+            bg=COLORES["fondo"], fg=COLORES["texto_suave"],
+            cursor="hand2",
+        )
+        self.lbl_borrar_historial.pack(side="right")
+        self.lbl_borrar_historial.bind("<Button-1>", lambda _e: self._borrar_historial())
+
     # ── Selección de vídeos ─────────────────────────────────────────────────
 
     def _seleccionar(self):
@@ -233,7 +265,6 @@ class App(BaseVentana):
         model = self._modelo
 
         resultados = []
-        audio_tmp = audio_tmp_path()
 
         for i, video in enumerate(videos, 1):
             self.cola.put(("prog_label", f"[{i}/{len(videos)}] {video.name}"))
@@ -254,129 +285,155 @@ class App(BaseVentana):
                 self.cola.put(("prog_barra", i))
                 continue
 
-            try:
-                self._log("Extrayendo audio...\n", "info")
-                extraer_audio(video, audio_tmp)
-                duracion = obtener_duracion(video)
+            # Temporal por vídeo: el context manager garantiza el borrado
+            # aunque haya excepción a mitad del procesamiento.
+            with audio_temp_file() as audio_tmp:
+                try:
+                    self._log("Extrayendo audio...\n", "info")
+                    extraer_audio(video, audio_tmp)
+                    duracion = obtener_duracion(video)
 
-                self._log("Transcribiendo con IA...\n", "info")
-                # Callback de progreso: la transcripción es el paso más largo
-                # y sin feedback parece colgada. Muestra % en la etiqueta superior.
-                def _prog_transcripcion(pct, _texto):
-                    self.cola.put((
-                        "prog_label",
-                        f"[{i}/{len(videos)}] {video.name} — transcribiendo {pct}%",
-                    ))
-                tx = transcribir_audio(audio_tmp, model, on_segment=_prog_transcripcion)
+                    self._log("Transcribiendo con IA...\n", "info")
+                    # Callback de progreso: la transcripción es el paso más largo
+                    # y sin feedback parece colgada. Muestra % en la etiqueta superior.
+                    def _prog_transcripcion(pct, _texto):
+                        self.cola.put((
+                            "prog_label",
+                            f"[{i}/{len(videos)}] {video.name} — transcribiendo {pct}%",
+                        ))
+                    tx = transcribir_audio(audio_tmp, model, on_segment=_prog_transcripcion)
 
-                txt_path = CARPETA_SALIDA / f"{video.stem}_transcripcion.txt"
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    for seg in tx["segments"]:
-                        f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
+                    txt_path = CARPETA_SALIDA / f"{video.stem}_transcripcion.txt"
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        for seg in tx["segments"]:
+                            f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
 
-                self._log("Analizando energía de audio...\n", "info")
-                # Lógica compartida con CLI — cualquier mejora se aplica aquí también.
-                corte = resolver_corte(tx, duracion, audio_tmp)
-                for nivel, msg in corte["logs"]:
-                    self._log(f"{msg}\n", nivel)
+                    self._log("Analizando energía de audio...\n", "info")
+                    # Lógica compartida con CLI — cualquier mejora se aplica aquí también.
+                    corte = resolver_corte(tx, duracion, audio_tmp)
+                    for nivel, msg in corte["logs"]:
+                        self._log(f"{msg}\n", nivel)
 
-                # "Sin vuelo": no generar salida, pero ofrecer ajuste manual
-                if corte["sin_vuelo"]:
-                    self._log(
-                        "⚠ No se detectó ningún vuelo en este clip.\n"
-                        "  Si es un vídeo de instrucciones o prueba, ignóralo.\n"
-                        "  Si crees que sí hay vuelo, ajústalo manualmente abajo.\n\n",
-                        "aviso",
-                    )
-                    resultados.append({
-                        "nombre": video.name, "ok": False,
-                        "detalle": "sin vuelo detectado",
-                        "necesita_ajuste": True, "video_path": video,
-                        "salida_path": salida, "duracion": duracion,
-                        "t0": 0, "t1": duracion,
-                    })
-                    self.cola.put(("prog_barra", i))
-                    continue
+                    # "Sin vuelo": no generar salida, pero ofrecer ajuste manual
+                    if corte["sin_vuelo"]:
+                        self._log(
+                            "⚠ No se detectó ningún vuelo en este clip.\n"
+                            "  Si es un vídeo de instrucciones o prueba, ignóralo.\n"
+                            "  Si crees que sí hay vuelo, ajústalo manualmente abajo.\n\n",
+                            "aviso",
+                        )
+                        resultados.append({
+                            "nombre": video.name, "ok": False,
+                            "detalle": "sin vuelo detectado",
+                            "necesita_ajuste": True, "video_path": video,
+                            "salida_path": salida, "duracion": duracion,
+                            "t0": 0, "t1": duracion,
+                        })
+                        self.cola.put(("prog_barra", i))
+                        continue
 
-                t0, t1 = corte["t_inicio"], corte["t_fin"]
-                t0_raw, t1_raw = corte["t_inicio_raw"], corte["t_fin_raw"]
-                txt0, txt1 = corte["texto_inicio"], corte["texto_fin"]
+                    t0, t1 = corte["t_inicio"], corte["t_fin"]
+                    t0_raw, t1_raw = corte["t_inicio_raw"], corte["t_fin_raw"]
+                    txt0, txt1 = corte["texto_inicio"], corte["texto_fin"]
 
-                if t0_raw is not None and txt0 != "[audio]":
-                    self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
-                elif t0_raw is None:
-                    self._log("⚠ Inicio no detectado — lo que oyó Whisper al principio:\n", "aviso")
-                    limite = duracion * BUSCAR_INICIO_HASTA_PORCENTAJE
-                    segs = [s for s in tx["segments"] if s["start"] <= limite and s["text"].strip()]
-                    for s in segs:
-                        self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
-
-                if t1_raw is not None and txt1 != "[audio]":
-                    self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
-                elif t1_raw is None:
-                    self._log("⚠ Llegada no detectada — lo que oyó Whisper al final:\n", "aviso")
-                    limite_fin = duracion * 0.70
-                    segs = [s for s in tx["segments"] if s["start"] >= limite_fin and s["text"].strip()]
-                    if segs:
+                    if t0_raw is not None and txt0 != "[audio]":
+                        self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
+                    elif t0_raw is None:
+                        self._log("⚠ Inicio no detectado — lo que oyó Whisper al principio:\n", "aviso")
+                        # Mostrar la primera mitad como pista de qué dijo el monitor.
+                        limite = duracion * 0.5
+                        segs = [s for s in tx["segments"] if s["start"] <= limite and s["text"].strip()]
                         for s in segs:
                             self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
-                    else:
-                        self._log("    (sin audio detectado en el último 30%)\n", "info")
 
-                self._log(f"Corte: {segundos_a_mmss(t0)} → {segundos_a_mmss(t1)} "
-                          f"({t1 - t0:.0f}s)\n", "info")
+                    if corte.get("fin_sintetizado"):
+                        self._log(
+                            f"⚠ Llegada SINTETIZADA: '{txt1.strip()}' → "
+                            f"{segundos_a_mmss(t1_raw)}\n",
+                            "aviso",
+                        )
+                        self._log(
+                            "  (sin voz ni caída del viento — revisa el corte manualmente)\n",
+                            "aviso",
+                        )
+                    elif t1_raw is not None and txt1 != "[audio]":
+                        self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
+                    elif t1_raw is None:
+                        self._log("⚠ Llegada no detectada — lo que oyó Whisper al final:\n", "aviso")
+                        limite_fin = duracion * 0.70
+                        segs = [s for s in tx["segments"] if s["start"] >= limite_fin and s["text"].strip()]
+                        if segs:
+                            for s in segs:
+                                self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
+                        else:
+                            self._log("    (sin audio detectado en el último 30%)\n", "info")
 
-                self._log("Generando vídeo final...\n", "info")
-                try:
-                    editar_video(video, t0, t1, salida)
-                except Exception:
-                    salida.unlink(missing_ok=True)
-                    raise
+                    self._log(f"Corte: {segundos_a_mmss(t0)} → {segundos_a_mmss(t1)} "
+                              f"({t1 - t0:.0f}s)\n", "info")
 
-                self._log("Verificando...\n", "info")
-                checks = verificar_corte(salida)
-                for ch_nombre, ch_ok, ch_det in checks:
-                    self._log(
-                        f"  {'✓' if ch_ok else '⚠'} {ch_nombre}: {ch_det}\n",
-                        "ok" if ch_ok else "aviso",
+                    self._log("Generando vídeo final...\n", "info")
+                    try:
+                        editar_video(video, t0, t1, salida)
+                    except Exception:
+                        salida.unlink(missing_ok=True)
+                        raise
+
+                    self._log("Verificando...\n", "info")
+                    checks = verificar_corte(salida)
+                    for ch_nombre, ch_ok, ch_det in checks:
+                        self._log(
+                            f"  {'✓' if ch_ok else '⚠'} {ch_nombre}: {ch_det}\n",
+                            "ok" if ch_ok else "aviso",
+                        )
+                    ok = all(ch_ok for _, ch_ok, _ in checks)
+                    fin_sint = bool(corte.get("fin_sintetizado"))
+                    detalle = (
+                        " | ".join(f"{n}:{d}" for n, ch_ok, d in checks if not ch_ok)
+                        or "OK"
                     )
-                ok = all(ch_ok for _, ch_ok, _ in checks)
-                detalle = (
-                    " | ".join(f"{n}:{d}" for n, ch_ok, d in checks if not ch_ok)
-                    or "OK"
-                )
-                self._log(("\n" if ok else "⚠ Revisa los puntos marcados arriba.\n\n"), "aviso" if not ok else "info")
-                resultados.append({
-                    "nombre": video.name,
-                    "ok": ok,
-                    "detalle": detalle,
-                    "necesita_ajuste": not ok,
-                    "video_path": video,
-                    "salida_path": salida,
-                    "duracion": duracion,
-                    "t0": t0,
-                    "t1": t1,
-                })
+                    # Fin sintetizado: aunque los checks técnicos pasen, el
+                    # corte se hizo sin evidencia física del fin → siempre se
+                    # marca para revisión manual con anotación visible.
+                    if fin_sint:
+                        detalle = (
+                            f"{detalle} · ⚠ fin sintetizado — revisar"
+                            if detalle != "OK"
+                            else "⚠ fin sintetizado — revisar"
+                        )
+                    self._log(("\n" if ok else "⚠ Revisa los puntos marcados arriba.\n\n"), "aviso" if not ok else "info")
+                    resultados.append({
+                        "nombre": video.name,
+                        "ok": ok and not fin_sint,
+                        "detalle": detalle,
+                        "necesita_ajuste": (not ok) or fin_sint,
+                        "fin_sintetizado": fin_sint,
+                        "video_path": video,
+                        "salida_path": salida,
+                        "duracion": duracion,
+                        "t0": t0,
+                        "t1": t1,
+                    })
 
-            except Exception as exc:
-                import traceback
-                tb = traceback.format_exc()
-                self._log(f"✗ Error: {exc}\n{tb}\n", "error")
-                resultados.append({
-                    "nombre": video.name,
-                    "ok": False,
-                    "detalle": str(exc),
-                    "necesita_ajuste": False,
-                    "video_path": video,
-                    "salida_path": salida,
-                    "duracion": duracion,
-                    "t0": t0,
-                    "t1": t1,
-                })
-            finally:
-                # El audio temporal se borra entre vídeos; atexit cubre el cierre.
-                audio_tmp.unlink(missing_ok=True)
-                self.cola.put(("prog_barra", i))
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self._log(f"✗ Error: {exc}\n{tb}\n", "error")
+                    resultados.append({
+                        "nombre": video.name,
+                        "ok": False,
+                        "detalle": str(exc),
+                        "necesita_ajuste": False,
+                        "video_path": video,
+                        "salida_path": salida,
+                        "duracion": duracion,
+                        "t0": t0,
+                        "t1": t1,
+                    })
+
+            # Progreso siempre, esté procesado o no — fuera del with para
+            # que se actualice incluso si el cleanup del audio temporal aún
+            # no ha completado (context manager lo gestiona).
+            self.cola.put(("prog_barra", i))
 
         self.cola.put(("fin", resultados))
 
@@ -543,6 +600,51 @@ class App(BaseVentana):
         carpeta = CARPETA_SALIDA.absolute()
         carpeta.mkdir(exist_ok=True)
         os.startfile(str(carpeta))
+
+    def _borrar_historial(self):
+        """Limpia historial_vuelos.json tras confirmar con el usuario.
+
+        Confirmación obligatoria (showinfo+askyesno) porque borrar el historial
+        hace que el fallback fin-anclado vuelva a usar el defecto de 60 s hasta
+        que se acumulen ≥3 detecciones nuevas — efecto visible.
+        """
+        durs = _cargar_historial_duraciones()
+        if not durs:
+            messagebox.showinfo(
+                "Historial vacío",
+                "No hay duraciones guardadas todavía.\n"
+                f"({HISTORIAL_VUELOS_FILE.name} no existe.)",
+                parent=self,
+            )
+            return
+
+        from statistics import median
+        mediana = median(durs) if durs else 0
+        confirmado = messagebox.askyesno(
+            "Borrar historial de duraciones",
+            f"Hay {len(durs)} duraciones guardadas "
+            f"(mediana actual {mediana:.0f}s).\n\n"
+            "Al borrarlas, el fallback fin-anclado volverá a usar el valor por "
+            "defecto (60s) hasta que vuelvan a acumularse ≥3 detecciones.\n\n"
+            "¿Borrar?",
+            parent=self,
+        )
+        if not confirmado:
+            return
+
+        if borrar_historial_duraciones():
+            messagebox.showinfo(
+                "Historial borrado",
+                "El historial se ha borrado correctamente.",
+                parent=self,
+            )
+        else:
+            messagebox.showerror(
+                "Error",
+                f"No se pudo borrar {HISTORIAL_VUELOS_FILE}.\n"
+                "Comprueba permisos del archivo.",
+                parent=self,
+            )
 
 
 if __name__ == "__main__":
