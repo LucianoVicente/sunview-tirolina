@@ -331,6 +331,106 @@ def audio_temp_file():
         path.unlink(missing_ok=True)
 
 
+# ─── Helpers de UI: frames, audio snippets, clips de preview ───
+# Estos helpers los consume la GUI de revisión semi-manual. Conviven aquí
+# (no en gui_tirolina.py) porque son envoltorios sobre ffmpeg/numpy y deben
+# ser invocables también desde scripts/tests sin tocar tkinter.
+
+def extraer_frame(video_path, t_s, out_path, ancho=320):
+    """Extrae un único frame del vídeo en t_s segundos como JPG escalado.
+
+    Usa `-ss` ANTES del input para seek rápido. Calidad q:v 3 = balance
+    entre tamaño y nitidez para miniaturas (no necesitamos prensa).
+    Devuelve True si el archivo se creó, False si ffmpeg falló.
+    """
+    t_s = max(0.0, float(t_s))
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{t_s:.2f}", "-i", str(video_path),
+        "-vframes", "1", "-q:v", "3",
+        "-vf", f"scale={int(ancho)}:-2",
+        str(out_path),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS,
+    )
+    return result.returncode == 0 and Path(out_path).exists()
+
+
+def extraer_3_frames(video_path, t_inicio_s, out_dir, ancho=240, gap_s=2.0):
+    """Storyboard de 3 frames alrededor de t_inicio_s: t-gap, t, t+gap.
+
+    Útil para que el revisor "vea movimiento" sin reproducir vídeo. Si la
+    extracción de algún frame falla, se devuelve None en esa posición.
+    Devuelve dict {"antes": Path|None, "inicio": Path|None, "despues": Path|None}.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(video_path).stem
+    resultados = {}
+    for etiqueta, offset in [("antes", -gap_s), ("inicio", 0.0), ("despues", gap_s)]:
+        out_path = out_dir / f"{stem}_frame_{etiqueta}.jpg"
+        ok = extraer_frame(video_path, t_inicio_s + offset, out_path, ancho=ancho)
+        resultados[etiqueta] = out_path if ok else None
+    return resultados
+
+
+def extraer_audio_snippet(audio_path, t0_s, duracion_s, out_path):
+    """Recorta un trozo del WAV de audio temporal para reproducirlo.
+
+    Útil para preview rápido en la GUI (espacio = reproducir 6 s del corte).
+    Asume `audio_path` es WAV mono 16 kHz (lo que produce `extraer_audio`).
+    """
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{max(0.0, t0_s):.2f}",
+        "-i", str(audio_path),
+        "-t", f"{max(0.1, duracion_s):.2f}",
+        "-c:a", "pcm_s16le",
+        str(out_path),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS,
+    )
+    return result.returncode == 0 and Path(out_path).exists()
+
+
+def extraer_clip_preview(video_path, t0_s, duracion_s, out_path):
+    """Genera un MP4 corto (t0 → t0+duracion) para reproducir externamente.
+
+    Copy-stream sin recodificar: rápido y conserva calidad. Usado por la
+    tecla "V" / botón "Ver vídeo" → os.startfile(out_path) abre con el
+    reproductor por defecto de Windows.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{max(0.0, t0_s):.2f}",
+        "-i", str(video_path),
+        "-t", f"{max(0.5, duracion_s):.2f}",
+        "-c", "copy",
+        str(out_path),
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS,
+    )
+    return result.returncode == 0 and Path(out_path).exists()
+
+
+def envolvente_rms(audio_path, n_puntos=800):
+    """Devuelve (rms_array, sr_efectivo) downsampleado a n_puntos.
+
+    Para visualizar la onda en matplotlib sin enviar 1M de muestras. El
+    eje X efectivo es len(rms_array) y cada bin representa
+    `duracion_audio / n_puntos` segundos.
+    """
+    import numpy as np
+    y, sr = _leer_audio_float32(audio_path)
+    if y is None or len(y) == 0:
+        return np.zeros(n_puntos, dtype=np.float32), 0
+    bin_size = max(1, len(y) // n_puntos)
+    n_efectivo = len(y) // bin_size
+    truncado = y[:n_efectivo * bin_size]
+    rms = np.sqrt(np.mean(truncado.reshape(n_efectivo, bin_size) ** 2, axis=1))
+    return rms.astype(np.float32), sr
+
+
 def _bloques_de_viento(audio_path):
     """
     Analiza el audio y devuelve [(t_ini, t_fin, energía_media), ...] con todos
@@ -431,24 +531,6 @@ MURO_VIENTO_UMBRAL_MIN = 0.01
 MURO_VIENTO_BASELINE_VENTANA_S = 5.0
 MURO_VIENTO_BUSQUEDA_DESDE_S = 1.0
 
-# ─── Backtrack al inicio de la rampa de subida ───
-# El muro detecta el final de la rampa (cuando RMS se establece sostenido
-# sobre el umbral), no el inicio del salto. Hay una rampa de 2-7 s entre
-# "rider se suelta" y "viento al máximo" porque el rider está acelerando.
-# En plataforma silenciosa la rampa es corta; en plataforma con viento
-# ambiente alto (baseline cerca del umbral), la rampa puede ser de 5-7 s.
-# Sin este backtrack, el corte empieza con el rider ya tirado al aire.
-#
-# Algoritmo: desde el frame del muro, retroceder hasta encontrar un frame
-# por debajo del nivel medio (baseline + 50 % del camino al umbral). Ese es
-# el último punto en zona "baja" antes de la subida → buen proxy del salto.
-# Si en MURO_RAMPA_MAX_S no se encuentra zona baja (plataforma muy ventosa
-# sin transición visible), aplicar offset fijo conservador.
-MURO_RAMPA_NIVEL = 0.5            # punto del camino baseline→umbral
-MURO_RAMPA_MAX_S = 6.0            # backtrack máximo (más arriesga incluir charla)
-MURO_RAMPA_OFFSET_FIJO_S = 3.0    # retroceso por defecto si no hay rampa visible
-
-
 def _detectar_onset_lanzamiento(
     audio_path,
     hasta_s,
@@ -480,13 +562,15 @@ def _detectar_onset_lanzamiento(
     Sin esto el detector podría dispararse con un pico DENTRO del vuelo.
 
     Devuelve dict:
-      t_inicio: float | None   — segundos del INICIO de la rampa (None si no se halló)
-      t_muro:   float | None   — segundos del fin de la rampa (donde RMS se estabilizó sobre el umbral)
-      origen_inicio: str       — "rampa 50%" (encontró cruce) o "offset fijo" (sin rampa visible)
+      t_inicio: float | None   — segundos del muro de viento (None si no se halló)
       baseline: float          — RMS p20 del primer `BASELINE_VENTANA_S`
       umbral:   float          — baseline + n_std * std (con suelo)
       pico:     float          — RMS máximo encontrado en [0, hasta_s]
       motivo:   str | None     — explicación cuando t_inicio es None
+
+    Es solo una sugerencia para la revisión humana. No intenta resolver el
+    sesgo del fin-de-rampa (el muro detecta cuando el rider ya tiene
+    velocidad, no el salto exacto). El usuario corrige a click en la GUI.
 
     NOTA SENSIBILIDAD: si en el futuro las GoPro tienen el "Wind Filter"
     activado, el pico de RMS baja (la cámara atenúa la banda <500 Hz que
@@ -499,8 +583,7 @@ def _detectar_onset_lanzamiento(
     import numpy as np
 
     res = {
-        "t_inicio": None, "t_muro": None, "origen_inicio": "",
-        "baseline": 0.0, "umbral": 0.0,
+        "t_inicio": None, "baseline": 0.0, "umbral": 0.0,
         "pico": 0.0, "motivo": None,
     }
 
@@ -558,50 +641,16 @@ def _detectar_onset_lanzamiento(
 
     frames_sost = max(1, int(round(sostenido_s / frame_por_s)))
 
-    i_muro = None
     for i in range(idx_min, idx_max - frames_sost + 1):
         if (rms[i : i + frames_sost] > umbral).all():
-            i_muro = i
-            break
+            res["t_inicio"] = i * frame_por_s
+            return res
 
-    if i_muro is None:
-        res["motivo"] = (
-            f"sin tramo sostenido > {umbral:.4f} durante {sostenido_s:.0f}s "
-            f"en [{MURO_VIENTO_BUSQUEDA_DESDE_S:.0f}s, {hasta_s:.0f}s] "
-            f"(pico observado {pico_ventana:.4f})"
-        )
-        return res
-
-    res["t_muro"] = i_muro * frame_por_s
-
-    # ─── Backtrack al inicio de la rampa ───
-    # El muro detecta el fin de la rampa de subida del viento (rider ya con
-    # velocidad). Para anclar el corte al INICIO del salto, retrocedemos
-    # hasta el último frame por debajo del nivel medio (50 % del camino
-    # baseline→umbral). Si no hay zona "baja" en MURO_RAMPA_MAX_S, aplicamos
-    # offset fijo (plataforma sin transición visible).
-    nivel_rampa = baseline + MURO_RAMPA_NIVEL * (umbral - baseline)
-    frames_rampa_max = max(1, int(round(MURO_RAMPA_MAX_S / frame_por_s)))
-    limite_atras = max(idx_min, i_muro - frames_rampa_max)
-
-    i_rampa = None
-    for j in range(i_muro - 1, limite_atras - 1, -1):
-        if rms[j] <= nivel_rampa:
-            i_rampa = j
-            break
-
-    if i_rampa is not None:
-        res["t_inicio"] = i_rampa * frame_por_s
-        res["origen_inicio"] = f"rampa 50% en {i_rampa * frame_por_s:.1f}s"
-    else:
-        # Sin zona baja → plataforma ventosa. Aplicar offset fijo conservador.
-        frames_offset = max(1, int(round(MURO_RAMPA_OFFSET_FIJO_S / frame_por_s)))
-        i_offset = max(idx_min, i_muro - frames_offset)
-        res["t_inicio"] = i_offset * frame_por_s
-        res["origen_inicio"] = (
-            f"offset fijo {MURO_RAMPA_OFFSET_FIJO_S:.0f}s "
-            f"(plataforma ventosa, sin rampa visible)"
-        )
+    res["motivo"] = (
+        f"sin tramo sostenido > {umbral:.4f} durante {sostenido_s:.0f}s "
+        f"en [{MURO_VIENTO_BUSQUEDA_DESDE_S:.0f}s, {hasta_s:.0f}s] "
+        f"(pico observado {pico_ventana:.4f})"
+    )
     return res
 
 
@@ -1065,162 +1114,15 @@ def validar_video(video_path):
 # incluso si hay excepción. Reemplaza al singleton anterior.
 
 
-# ========== RESOLUCIÓN DE CORTE COMPARTIDA ==========
-# Esta función es la ÚNICA fuente de verdad para decidir t_inicio/t_fin.
-# Tanto CLI (procesar_video) como GUI (gui_tirolina._worker) la usan.
-# Cualquier cambio en la lógica de detección se aplica automáticamente a ambos flujos.
-
-# ─── Historial dinámico de duraciones de vuelo ───
-# Reemplaza a la antigua constante DURACION_VUELO_TIPICA_S=80. Se va aprendiendo
-# de los vuelos que SÍ se detectaron bien (muro+fin físicos) y la mediana se usa
-# como fallback cuando el muro de viento no se detecta. Datos por parque y
-# tirolina concretos → mucho mejor que un número mágico.
-HISTORIAL_VUELOS_FILE = _BASE / "historial_vuelos.json"
-HISTORIAL_MAX_ENTRADAS = 50          # límite de ventana — descarta lo antiguo
-HISTORIAL_MIN_ENTRADAS = 3           # bajo esto preferimos DEFECTO antes que mediana
-DURACION_VUELO_DEFECTO_S = 60.0      # último recurso si el historial está vacío
-
-# ─── Filtro de calidad antes de guardar al historial ───
-# Una mala detección del muro (pico apenas por encima del umbral, plataforma con
-# viento ambiente) puede colarse y polucionar la mediana del fallback. Estos
-# umbrales discriminan onsets "confiados" de los marginales.
-#
-# Calibrados con los clips reales: los 3 fallos de la tirada (3.2/4.3/5.1) tenían
-# ratio pico/umbral en 1.36-1.51 y margen 0.056-0.069, mientras los buenos
-# estaban en ratio ≥1.73 y margen ≥0.075. El umbral 1.5/0.05 caza la mayoría
-# de los marginales sin descartar los buenos.
-HISTORIAL_PICO_UMBRAL_RATIO_MIN = 1.5
-HISTORIAL_PICO_UMBRAL_MARGEN_MIN = 0.05
-HISTORIAL_DURACION_MIN_S = 40        # vuelos de tirolina típicos: 50-90 s
-HISTORIAL_DURACION_MAX_S = 120
-HISTORIAL_OUTLIER_DELTA_S = 25       # rechazo si dista >25 s de la mediana actual
+# ========== SUGERENCIAS DE CORTE PARA REVISIÓN HUMANA ==========
+# resolver_corte ya no decide nada definitivo: produce sugerencias que el humano
+# valida/ajusta en la GUI. Detectamos el muro como pista de inicio y reconciliamos
+# Whisper+caída del viento para sugerir fin. Si el muro no se detecta, t_inicio
+# sugerido = None y el humano lo marca a click en la onda.
 
 TOL_FIN_VS_VIENTO_S    = 15   # frase de llegada >15 s tras el fin del viento = post-charla, no llegada
 VENTANA_BUSQUEDA_LLEGADA_S = 20  # al recortar llegada tardía, buscar en los primeros 20 s tras el viento
 TOL_FIN_DENTRO_VIENTO_S = 10  # frase de llegada >10 s antes del fin del viento = exclamación mid-flight
-
-
-def _cargar_historial_duraciones():
-    """Lista de duraciones (segundos) de vuelos detectados con éxito.
-
-    Devuelve [] si el archivo no existe o está corrupto — el caller debe estar
-    preparado para historial vacío (en ese caso se usa DURACION_VUELO_DEFECTO_S).
-    """
-    try:
-        with open(HISTORIAL_VUELOS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
-    duraciones = data.get("duraciones", [])
-    return [float(d) for d in duraciones if isinstance(d, (int, float)) and d > 0]
-
-
-def _chequear_confianza_onset(pico, umbral):
-    """¿El par (pico, umbral) representa un onset confiable para APRENDIZAJE?
-
-    Solo gate del guardado al historial: la confianza pura (ratio≥1.5 Y
-    margen≥0.05) rechaza detecciones marginales que no merecen propagarse
-    a la mediana de fallback. Para la DECISIÓN de corte usamos un criterio
-    distinto (coherencia muro+t_fin en `resolver_corte`) porque rechazar por
-    ratio crearía falsos negativos en plataformas con viento ambiente alto
-    pero detección real correcta.
-
-    Devuelve (confiable: bool, motivo: str). motivo es "" si pasa o una
-    descripción legible si se rechaza.
-    """
-    if umbral <= 0:
-        return False, "umbral inválido (≤0)"
-    ratio = pico / umbral
-    if ratio < HISTORIAL_PICO_UMBRAL_RATIO_MIN:
-        return False, (
-            f"onset marginal (pico/umbral={ratio:.2f} < "
-            f"{HISTORIAL_PICO_UMBRAL_RATIO_MIN})"
-        )
-    margen = pico - umbral
-    if margen < HISTORIAL_PICO_UMBRAL_MARGEN_MIN:
-        return False, (
-            f"onset marginal (pico−umbral={margen:.3f} < "
-            f"{HISTORIAL_PICO_UMBRAL_MARGEN_MIN})"
-        )
-    return True, ""
-
-
-def _guardar_duracion_vuelo(duracion_s, pico, umbral):
-    """Añade `duracion_s` al historial si pasa el filtro de calidad.
-
-    Solo se llama cuando inicio y fin se detectaron por señales FÍSICAS
-    (muro de viento + fin del viento o frase de llegada) — nunca tras un
-    fallback, para no autoalimentarse con valores derivados.
-
-    Filtro de calidad (en orden):
-      1) Duración en rango razonable (40-120 s, típico de tirolina).
-      2) Confianza del onset (vía `_chequear_confianza_onset`): los marginales
-         producen duraciones cortas que envenenan la mediana.
-      3) Outlier vs mediana actual (sólo si hay ≥ HISTORIAL_MIN_ENTRADAS):
-         duraciones que distan > 25 s de la mediana actual probablemente
-         vienen de una mala detección.
-
-    Devuelve (guardado: bool, motivo: str). El caller decide cómo loguear.
-    """
-    if not (HISTORIAL_DURACION_MIN_S <= duracion_s <= HISTORIAL_DURACION_MAX_S):
-        return False, (
-            f"fuera de rango [{HISTORIAL_DURACION_MIN_S}, "
-            f"{HISTORIAL_DURACION_MAX_S}]s"
-        )
-
-    confiable, motivo = _chequear_confianza_onset(pico, umbral)
-    if not confiable:
-        return False, motivo
-
-    duraciones = _cargar_historial_duraciones()
-    if len(duraciones) >= HISTORIAL_MIN_ENTRADAS:
-        from statistics import median
-        med = median(duraciones)
-        if abs(duracion_s - med) > HISTORIAL_OUTLIER_DELTA_S:
-            return False, (
-                f"outlier vs mediana actual ({med:.0f}s, "
-                f"Δ={duracion_s - med:+.0f}s)"
-            )
-
-    duraciones.append(float(duracion_s))
-    duraciones = duraciones[-HISTORIAL_MAX_ENTRADAS:]
-    try:
-        with open(HISTORIAL_VUELOS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"duraciones": duraciones}, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        # No es crítico: el sistema sigue funcionando con DURACION_VUELO_DEFECTO_S.
-        return False, f"error de E/S al persistir ({e})"
-    return True, "guardada"
-
-
-def borrar_historial_duraciones():
-    """Borra el archivo de historial. Idempotente: si no existe, no error.
-
-    Pensado para limpieza manual cuando el usuario sospecha que el fallback
-    está cortando mal (probablemente por duraciones contaminadas en el JSON).
-    Devuelve True si tras la operación el archivo no existe.
-    """
-    try:
-        HISTORIAL_VUELOS_FILE.unlink(missing_ok=True)
-        return True
-    except OSError:
-        return False
-
-
-def _duracion_vuelo_estimada():
-    """Mediana del historial si hay ≥ HISTORIAL_MIN_ENTRADAS, si no DEFECTO.
-
-    Devuelve (duracion_s, origen) — origen es "mediana(N=…)" o "defecto" para
-    poder loguear de dónde salió el valor.
-    """
-    duraciones = _cargar_historial_duraciones()
-    if len(duraciones) >= HISTORIAL_MIN_ENTRADAS:
-        # Mediana sin numpy: import barato y evita cargar numpy si esta es la
-        # única llamada del flujo (la GUI lo precarga, así que en práctica ya
-        # está en memoria — pero por simplicidad usamos statistics).
-        from statistics import median
-        return median(duraciones), f"mediana(N={len(duraciones)})"
-    return DURACION_VUELO_DEFECTO_S, "defecto"
 
 
 def _primera_frase_llegada(segments, desde, hasta):
@@ -1237,308 +1139,98 @@ def _primera_frase_llegada(segments, desde, hasta):
     return None
 
 
-def resolver_corte(transcripcion, duracion, audio_path):
-    """
-    Estrategia híbrida (FIN por Whisper / INICIO por física del audio):
-      1) FIN — señal más fiable: frase de llegada del rider en el último 30 %
-         reconciliada con la caída del viento ("¿qué tal?", "madre mía"...).
-         Whisper sigue siendo apropiado aquí: el silencio relativo tras llegar
-         a plataforma hace que la transcripción del fin sea muy estable.
+def sugerir_corte(transcripcion, duracion, audio_path):
+    """Produce sugerencias de t_inicio/t_fin para revisión humana.
 
-      2) INICIO — muro de viento como fuente primaria. Cadena de fallbacks:
-         a) Muro de viento COHERENTE (`_detectar_onset_lanzamiento`): primer
-            instante en que el RMS sube sobre el ruido base y se mantiene
-            ≥3 s. Coherente = duración resultante muro→t_fin cae en
-            [40,120]s. Si no es coherente, uno de los dos anclajes miente y
-            es mejor el fallback. (Si no hay t_fin se acepta el muro tal cual,
-            mejor que nada.)
-         b) `t_fin - mediana_historial`: si tenemos ≥3 vuelos detectados con
-            éxito en el pasado, su mediana de duración como ancla. Tiene
-            PRIORIDAD sobre v_ini porque combina señal física (t_fin) con
-            estadística aprendida del parque concreto.
-         c) `t_fin - DURACION_VUELO_DEFECTO_S` (60 s): mismo origen que (b)
-            pero sin historial suficiente.
-         d) `v_ini` (inicio del bloque de viento principal): umbral más laxo
-            que el muro. Último recurso cuando no hay ni muro ni t_fin —
-            raro, pero evita perder vídeos enteros.
-
-      3) APRENDIZAJE: cuando inicio y fin se determinan por SEÑALES FÍSICAS
-         (muro + fin del viento / frase reconciliada con audio), la duración
-         se persiste en historial_vuelos.json. Esto adapta el fallback al
-         parque y tirolina concretos (mucho mejor que un número mágico).
-
-      4) Whisper NO se usa para detectar el INICIO. Los falsos positivos
-         de la charla de plataforma ("vamos", "listo", "acércate", "número
-         uno") son demasiado frecuentes y caen exactamente en la ventana
-         que más daño hace (justo antes del salto).
+    NO decide nada definitivo. Detecta el muro como pista de inicio y
+    reconcilia Whisper + caída del viento para sugerir fin. El humano
+    valida o ajusta a click en la onda.
 
     Devuelve dict:
-      t_inicio, t_fin              — segundos absolutos con márgenes aplicados
-      t_inicio_raw, t_fin_raw      — segundos sin márgenes (None si no detectado)
-      texto_inicio, texto_fin      — origen del timestamp ("[muro viento]",
-                                     "[inicio bloque viento]", "[fin − Ns]",
-                                     "[inicio + Ns]", "[audio]", o frase de llegada)
-      sin_vuelo                    — True si no se pudo detectar ningún fin
-      fin_sintetizado              — True si t_fin se calculó por start-anclado
-                                     (sin evidencia física del fin) → revisar manualmente
-      logs                         — lista de (nivel, mensaje) para que el caller imprima
+      t_inicio_raw, t_fin_raw  — segundos sin márgenes (None si no se detectó)
+      texto_inicio, texto_fin  — origen del timestamp (para mostrar pista)
+      logs                     — lista de (nivel, mensaje) para el caller
     """
+    logs: list[tuple[str, str]] = []
+
+    # ─── FIN sugerido (Whisper + audio) ───
     t_fin_raw, texto_fin = buscar_fin(transcripcion, duracion)
 
     bloques = _bloques_de_viento(audio_path)
     principal = _bloque_principal(bloques)
-    if principal is not None:
-        v_ini, v_fin = principal
-    else:
-        v_ini = v_fin = None
-
-    logs: list[tuple[str, str]] = []
+    v_ini, v_fin = principal if principal is not None else (None, None)
 
     if detectar_multiples_vuelos(audio_path):
         logs.append((
             "aviso",
-            "Se detectaron 2 o más vuelos en este clip — "
-            "se cortará solo el más energético. Si necesitas los otros, "
-            "ajústalo a mano."
+            "Se detectaron 2 o más vuelos en este clip — sugerencia para el "
+            "más energético. Ajústalo a mano si hay que partir."
         ))
 
-    # ─── FIN: la señal ancla ───
-    # Prioridad: 1) frase de llegada cercana al fin del viento;
-    #            2) fin del bloque de viento;
-    #            3) frase de llegada aislada.
     if v_fin is not None:
         if t_fin_raw is None:
             t_fin_raw, texto_fin = v_fin, "[audio]"
             logs.append(("ok", f"Fin por audio (caída del viento): {segundos_a_mmss(v_fin)}"))
         elif v_ini is not None and t_fin_raw < v_ini:
-            logs.append((
-                "aviso",
-                f"Frase de llegada ({segundos_a_mmss(t_fin_raw)}) cae ANTES del "
-                f"vuelo ({segundos_a_mmss(v_ini)}) — falso positivo, usando audio"
-            ))
+            logs.append(("aviso",
+                f"Frase de llegada ({segundos_a_mmss(t_fin_raw)}) ANTES del vuelo "
+                f"({segundos_a_mmss(v_ini)}) — falso positivo, usando audio"))
             t_fin_raw, texto_fin = v_fin, "[audio]"
         elif t_fin_raw < v_fin - TOL_FIN_DENTRO_VIENTO_S:
-            # La frase cae bien dentro del bloque de vuelo: típicamente una
-            # exclamación del rider mid-flight ("¡madre mía!", "wow") que
-            # Whisper transcribió como llegada. La llegada real es el fin del
-            # viento (cuando deja de soplar al frenar).
-            logs.append((
-                "aviso",
-                f"Frase de llegada ({segundos_a_mmss(t_fin_raw)}) cae dentro del "
-                f"vuelo (Δ={v_fin - t_fin_raw:.0f}s antes del fin del viento) "
-                f"— exclamación mid-flight, usando audio"
-            ))
+            logs.append(("aviso",
+                f"Frase ({segundos_a_mmss(t_fin_raw)}) dentro del vuelo — exclamación "
+                f"mid-flight, usando audio"))
             t_fin_raw, texto_fin = v_fin, "[audio]"
         elif t_fin_raw > v_fin + TOL_FIN_VS_VIENTO_S:
             mejor = _primera_frase_llegada(
-                transcripcion["segments"],
-                desde=v_fin - 5,
+                transcripcion["segments"], desde=v_fin - 5,
                 hasta=v_fin + VENTANA_BUSQUEDA_LLEGADA_S,
             )
             if mejor is not None:
-                logs.append((
-                    "aviso",
-                    f"Frase de llegada muy tardía ({segundos_a_mmss(t_fin_raw)}); "
-                    f"usando primera frase tras el vuelo: {segundos_a_mmss(mejor[0])}"
-                ))
+                logs.append(("aviso",
+                    f"Llegada tardía ({segundos_a_mmss(t_fin_raw)}); "
+                    f"usando primera frase tras el vuelo: {segundos_a_mmss(mejor[0])}"))
                 t_fin_raw, texto_fin = mejor
             else:
-                logs.append((
-                    "aviso",
-                    f"Frase de llegada muy tardía ({segundos_a_mmss(t_fin_raw)}); "
-                    f"sin alternativa cerca del fin del viento — usando audio"
-                ))
+                logs.append(("aviso",
+                    f"Llegada tardía ({segundos_a_mmss(t_fin_raw)}); usando audio"))
                 t_fin_raw, texto_fin = v_fin, "[audio]"
 
-    # ─── INICIO: cadena muro_confiable → fin-anclado → v_ini → None ───
-    # Acotamos al primer 60 % del clip por defecto. Si ya tenemos t_fin_raw,
-    # cerramos además 10 s antes del fin: el muro NO puede estar dentro del
-    # vuelo (allí ya hay viento continuo, no transición).
+    # ─── INICIO sugerido (muro de viento) ───
     hasta_muro = duracion * 0.60
     if t_fin_raw is not None:
         hasta_muro = min(hasta_muro, max(10.0, t_fin_raw - 10))
 
     muro = _detectar_onset_lanzamiento(audio_path, hasta_s=hasta_muro)
 
-    # ─── FIN SINTETIZADO (start-anclado) ───
-    # Si tenemos muro pero no t_fin (ni Whisper ni caída del viento), el cut
-    # iría hasta el final del clip → potencialmente 3+ minutos de viento sin
-    # acción. Sintetizamos t_fin = t_muro + mediana_historial (o defecto).
-    # Es el fin-anclado pero hacia delante: la mediana acota la duración al
-    # rango típico del parque. Marcamos `fin_sintetizado=True` para que la
-    # GUI lo destaque para revisión manual — no tenemos evidencia física del
-    # fin, solo una estimación estadística.
-    fin_sintetizado = False
-    if muro["t_inicio"] is not None and t_fin_raw is None:
-        duracion_est, origen = _duracion_vuelo_estimada()
-        t_fin_raw = min(duracion, muro["t_inicio"] + duracion_est)
-        texto_fin = f"[inicio + {duracion_est:.0f}s {origen}]"
-        fin_sintetizado = True
-        logs.append((
-            "aviso",
-            f"[DEBUG FIN] Sin llegada detectada (ni voz ni caída del viento) — "
-            f"sintetizado en {segundos_a_mmss(t_fin_raw)} "
-            f"(t_inicio + {duracion_est:.0f}s vía {origen}). "
-            f"Revisar manualmente."
-        ))
-
-    # Gate del muro como ancla de corte: la confianza pura (ratio pico/umbral)
-    # rechaza falsos negativos pero también detecciones reales en plataforma
-    # ventosa. Mejor heurística: coherencia muro+t_fin. Si la duración
-    # resultante cae en [40,120]s (rango típico de tirolina), los dos anclajes
-    # se sostienen mutuamente. Si está fuera, uno de los dos miente → mejor
-    # usar fin-anclado. Si no hay t_fin, no se puede chequear coherencia y
-    # confiamos en el muro (mejor que nada). Nota: tras la síntesis anterior,
-    # si llegamos aquí con t_fin_raw None es porque tampoco hay muro detectado.
-    if muro["t_inicio"] is not None and t_fin_raw is not None:
-        duracion_si_muro = t_fin_raw - muro["t_inicio"]
-        muro_coherente = (
-            HISTORIAL_DURACION_MIN_S <= duracion_si_muro <= HISTORIAL_DURACION_MAX_S
-        )
-        motivo_muro = (
-            ""
-            if muro_coherente
-            else (
-                f"duración resultante {duracion_si_muro:.0f}s fuera de rango "
-                f"[{HISTORIAL_DURACION_MIN_S}, {HISTORIAL_DURACION_MAX_S}]s"
-            )
-        )
-    elif muro["t_inicio"] is not None:
-        muro_coherente = True
-        motivo_muro = ""
-    else:
-        muro_coherente = False
-        motivo_muro = muro["motivo"]
-
-    # Sanity check para v_ini como último recurso: rechaza valores degenerados
-    # (≈0 → viento desde el primer frame, normalmente viento ambiente
-    # constante) y los que caen demasiado cerca del fin (no son inicio
-    # de vuelo). Solo así v_ini es información útil.
-    v_ini_util = (
-        v_ini is not None
-        and v_ini >= 1.0
-        and (t_fin_raw is None or v_ini <= t_fin_raw - 10)
-    )
-
-    if muro_coherente:
+    if muro["t_inicio"] is not None:
         t_inicio_raw = muro["t_inicio"]
         texto_inicio = "[muro viento]"
-        info_muro = (
-            f"muro en {segundos_a_mmss(muro['t_muro'])} ({muro['origen_inicio']})"
-            if muro.get("t_muro") is not None
-            else ""
-        )
         logs.append((
             "ok",
-            f"[DEBUG INICIO] Onset de viento detectado en "
-            f"{segundos_a_mmss(t_inicio_raw)} "
-            f"({info_muro}, baseline={muro['baseline']:.4f}, "
-            f"umbral={muro['umbral']:.4f}, pico={muro['pico']:.4f}, "
-            f"ventana 0-{hasta_muro:.0f}s)"
-        ))
-    elif t_fin_raw is not None:
-        # Fin-anclado: prioridad sobre v_ini. Si el muro no es coherente
-        # (ya sea porque no se detectó o porque su duración resultante cae
-        # fuera de [40,120]s), v_ini sobre la misma señal con criterio más
-        # laxo (umbral 30 % del pico) probablemente esté midiendo viento
-        # ambiente, no el lanzamiento. La mediana del historial aprendida
-        # del parque concreto + t_fin físico es ancla más fiable.
-        duracion_est, origen = _duracion_vuelo_estimada()
-        t_inicio_raw = max(0, t_fin_raw - duracion_est)
-        texto_inicio = f"[fin − {duracion_est:.0f}s {origen}]"
-        logs.append((
-            "aviso",
-            f"[DEBUG INICIO] Fallback fin-anclado usado en "
-            f"{segundos_a_mmss(t_inicio_raw)} "
-            f"(t_fin − {duracion_est:.0f}s vía {origen}; "
-            f"muro descartado: {motivo_muro}; "
-            f"baseline={muro['baseline']:.4f}, umbral={muro['umbral']:.4f}, "
-            f"pico={muro['pico']:.4f})"
-        ))
-    elif v_ini_util:
-        # Último recurso: sin muro coherente Y sin t_fin para anclar. v_ini
-        # es la peor señal (umbral laxo sobre viento ambiente posible), pero
-        # mejor que nada — sin ella perderíamos el vídeo entero. Raro: requiere
-        # que falle tanto el muro como Whisper+caída del viento del fin.
-        t_inicio_raw = v_ini
-        texto_inicio = "[inicio bloque viento]"
-        logs.append((
-            "aviso",
-            f"[DEBUG INICIO] Sin muro coherente ({motivo_muro}) y sin "
-            f"fin físico — último recurso: inicio del bloque de viento "
-            f"en {segundos_a_mmss(v_ini)}"
+            f"Inicio sugerido en {segundos_a_mmss(t_inicio_raw)} "
+            f"(baseline={muro['baseline']:.3f}, umbral={muro['umbral']:.3f}, "
+            f"pico={muro['pico']:.3f})"
         ))
     else:
         t_inicio_raw = None
         texto_inicio = None
         logs.append((
             "aviso",
-            f"[DEBUG INICIO] Sin ancla de inicio "
-            f"(muro: {motivo_muro}; sin fin; sin bloque de viento útil)"
+            f"Inicio NO detectado por muro ({muro['motivo']}) — marca a click en la onda"
         ))
 
-    # ─── SIN VUELO ───
-    # No hay fin Y no hay ningún inicio reconocible → vídeo de instrucciones,
-    # prueba o subido por error.
-    sin_vuelo = False
-    if t_inicio_raw is None and t_fin_raw is None:
-        sin_vuelo = True
-    elif t_inicio_raw is not None and t_fin_raw is not None:
-        if t_fin_raw - t_inicio_raw < 10:
-            sin_vuelo = True
-
-    # ─── APRENDIZAJE ───
-    # Persistimos la duración SOLO cuando la pareja (inicio, fin) viene de
-    # señales físicas Y el filtro de calidad la acepta. Si el inicio es
-    # fallback (mediana o v_ini), guardar esa duración crearía un bucle de
-    # retroalimentación — la mediana se estabilizaría en su propio valor.
-    # El filtro de calidad además bloquea onsets marginales que producen
-    # duraciones cortas envenenando la mediana (caso de los 3 fallos
-    # observados con plataforma ventosa).
-    if (
-        not sin_vuelo
-        and texto_inicio == "[muro viento]"
-        and t_fin_raw is not None
-        and t_inicio_raw is not None
-    ):
-        duracion_vuelo = t_fin_raw - t_inicio_raw
-        guardado, motivo = _guardar_duracion_vuelo(
-            duracion_vuelo, pico=muro["pico"], umbral=muro["umbral"]
-        )
-        if guardado:
-            logs.append((
-                "ok",
-                f"[DEBUG HISTORIAL] Duración {duracion_vuelo:.0f}s guardada"
-            ))
-        else:
-            logs.append((
-                "aviso",
-                f"[DEBUG HISTORIAL] Duración {duracion_vuelo:.0f}s descartada: "
-                f"{motivo}"
-            ))
-
-    # ─── MÁRGENES ───
-    if t_inicio_raw is not None:
-        t_inicio = max(0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
-    else:
-        t_inicio = 0.0
-
-    if t_fin_raw is not None:
-        t_fin = min(duracion, t_fin_raw + SEGUNDOS_DESPUES_FIN)
-    else:
-        t_fin = duracion
-
     return {
-        "t_inicio": t_inicio,
-        "t_fin": t_fin,
         "t_inicio_raw": t_inicio_raw,
         "t_fin_raw": t_fin_raw,
         "texto_inicio": texto_inicio,
         "texto_fin": texto_fin,
-        "sin_vuelo": sin_vuelo,
-        "fin_sintetizado": fin_sintetizado,
         "logs": logs,
     }
+
+
+# Alias hacia atrás para compatibilidad con scripts externos eventuales.
+resolver_corte = sugerir_corte
 
 
 # ========== PROCESAMIENTO PRINCIPAL ==========
@@ -1570,40 +1262,45 @@ def procesar_video(video_path, model):
             for seg in transcripcion["segments"]:
                 f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
 
-        # Detección de corte (lógica compartida con el GUI)
+        # Sugerencia de corte (lógica compartida con el GUI)
         print("→ Buscando señal de salida y llegada y analizando audio...")
-        corte = resolver_corte(transcripcion, duracion, audio_tmp)
+        corte = sugerir_corte(transcripcion, duracion, audio_tmp)
         for nivel, msg in corte["logs"]:
             prefijo = "  ⚠" if nivel == "aviso" else "  ✓"
             print(f"{prefijo} {msg}")
 
-        # Caso "sin vuelo": no generar salida, devolver error claro.
-        if corte["sin_vuelo"]:
-            print("  ⚠ No se detectó ningún vuelo en este clip — saltando")
-            return False, "sin vuelo detectado (vídeo de instrucciones, prueba o subido por error)"
+        t_inicio_raw = corte["t_inicio_raw"]
+        t_fin_raw = corte["t_fin_raw"]
 
-        t_inicio, t_fin = corte["t_inicio"], corte["t_fin"]
-        texto_inicio, texto_fin = corte["texto_inicio"], corte["texto_fin"]
+        # Si no hay ni inicio ni fin sugeridos, no hay nada que cortar.
+        if t_inicio_raw is None and t_fin_raw is None:
+            print("  ⚠ Sin inicio ni fin detectados — saltando")
+            return False, "sin sugerencia de corte (revisar manualmente en la GUI)"
 
-        if corte["t_inicio_raw"] is not None and texto_inicio != "[audio]":
-            print(f"  ✓ Salida detectada:  '{texto_inicio.strip()}' → {segundos_a_mmss(corte['t_inicio_raw'])}")
-        elif corte["t_inicio_raw"] is None:
-            print("  ⚠ Inicio no detectado, empezando desde 0s")
+        # Aplicar márgenes (mismas constantes que antes).
+        t_inicio = (
+            max(0.0, t_inicio_raw - SEGUNDOS_ANTES_INICIO)
+            if t_inicio_raw is not None else 0.0
+        )
+        t_fin = (
+            min(duracion, t_fin_raw + SEGUNDOS_DESPUES_FIN)
+            if t_fin_raw is not None else duracion
+        )
 
-        if corte.get("fin_sintetizado"):
-            print(f"  ⚠ Llegada SINTETIZADA: '{texto_fin.strip()}' → {segundos_a_mmss(corte['t_fin_raw'])}")
-            print(f"    (sin voz ni caída del viento — REVISAR el corte manualmente)")
-        elif corte["t_fin_raw"] is not None and texto_fin != "[audio]":
-            print(f"  ✓ Llegada detectada: '{texto_fin.strip()}' → {segundos_a_mmss(corte['t_fin_raw'])}")
-        elif corte["t_fin_raw"] is None:
-            print("  ⚠ Fin no detectado, usando fin del clip")
-            print(f"    (revisa {transcript_path.name} para ver qué dijo el monitor)")
+        if t_inicio_raw is not None:
+            print(f"  ✓ Inicio sugerido: '{corte['texto_inicio']}' → {segundos_a_mmss(t_inicio_raw)}")
+        else:
+            print("  ⚠ Inicio no sugerido, empezando desde 0s — revisar manualmente")
+        if t_fin_raw is not None:
+            print(f"  ✓ Fin sugerido: '{corte['texto_fin']}' → {segundos_a_mmss(t_fin_raw)}")
+        else:
+            print("  ⚠ Fin no sugerido, usando fin del clip — revisar manualmente")
 
         # Confirmar con el usuario (solo en modo manual)
         if not MODO_AUTO:
             t_inicio, t_fin = confirmar_o_ajustar(t_inicio, t_fin, duracion, video_path)
         else:
-            print(f"\n  Corte automático: {segundos_a_mmss(t_inicio)} → {segundos_a_mmss(t_fin)} ({t_fin - t_inicio:.0f}s)")
+            print(f"\n  Corte automático (best-effort): {segundos_a_mmss(t_inicio)} → {segundos_a_mmss(t_fin)} ({t_fin - t_inicio:.0f}s)")
 
         # Editar — si falla a medias, borrar el MP4 parcial.
         print("→ Generando vídeo final (recorte + logo + compresión)...")

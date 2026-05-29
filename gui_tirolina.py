@@ -1,5 +1,12 @@
 """
-Sunview Park — Interfaz gráfica para edición de vídeos de tirolina
+Sunview Park — Asistente de edición de tirolina (flujo de 3 fases)
+
+  Fase 1 (Análisis automático): extrae audio, transcribe, sugiere t_inicio/t_fin,
+          extrae 3 frames y la onda. No renderiza nada.
+  Fase 2 (Revisión humana): tarjeta por clip con storyboard + onda + controles
+          editables. Atajos: ↑↓ navega, ←→ ±1s inicio, Enter aprueba, Espacio
+          reproduce audio, V abre clip en reproductor externo.
+  Fase 3 (Render batch): genera los vídeos finales solo de los clips aprobados.
 """
 
 import tkinter as tk
@@ -8,12 +15,15 @@ import threading
 import queue
 import os
 import sys
+import tempfile
+import shutil
+import winsound
 from pathlib import Path
 
-# pythonw.exe no tiene consola — algunas librerías (tqdm, whisper) fallan
-# al escribir en sys.stdout/stderr si son None. Mantenemos referencia a los
-# handles para cerrarlos al salir y no fugar descriptores.
-import atexit as _atexit  # alias local para no chocar con otros imports
+# pythonw.exe no tiene consola — librerías como tqdm/whisper fallan al
+# escribir en sys.stdout/stderr si son None. Mantenemos handles a devnull
+# y los cerramos al salir para no fugar file descriptors.
+import atexit as _atexit
 _DEVNULL_HANDLES = []
 if sys.stdout is None:
     _h = open(os.devnull, "w")
@@ -33,25 +43,34 @@ def _cerrar_devnull():
         except OSError:
             pass
 
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     DRAG_DROP = True
 except ImportError:
     DRAG_DROP = False
 
+from PIL import Image, ImageTk
+
+# FigureCanvasTkAgg ya fija el backend correcto (TkAgg). No forzamos otro
+# antes para no romper el embedding en Tkinter.
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
-    editar_video, verificar_corte,
-    validar_video, resolver_corte, audio_temp_file,
-    cargar_modelo_whisper,
+    editar_video, verificar_corte, validar_video,
+    sugerir_corte, cargar_modelo_whisper,
+    extraer_3_frames, extraer_audio_snippet, extraer_clip_preview,
+    envolvente_rms,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES,
-    borrar_historial_duraciones, _cargar_historial_duraciones,
-    HISTORIAL_VUELOS_FILE,
+    SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
 )
 
 COLORES = {
     "fondo":        "#F5F7FA",
     "panel":        "#FFFFFF",
+    "panel_sel":    "#E3F0FF",
     "acento":       "#1A73E8",
     "ok":           "#34A853",
     "aviso":        "#C07700",
@@ -59,594 +78,1017 @@ COLORES = {
     "texto":        "#202124",
     "texto_suave":  "#5F6368",
     "borde":        "#DADCE0",
+    "marcador_ini": "#34A853",
+    "marcador_fin": "#EA4335",
 }
 FUENTE = "Segoe UI"
 
 BaseVentana = TkinterDnD.Tk if DRAG_DROP else tk.Tk
 
+# Tamaños de UI
+ANCHO_FRAME = 220
+ALTO_FRAME = 124
+PREVIEW_DUR_S = 6.0          # ventana de audio/vídeo de preview (3s antes + 3s despues)
+
 
 class App(BaseVentana):
     def __init__(self):
         super().__init__()
-        self.title("Sunview Park — Editor de Tirolina")
-        self.geometry("700x600")
-        self.minsize(580, 480)
+        self.title("Sunview Park — Asistente de edición")
+        self.geometry("1180x720")
+        self.minsize(960, 600)
         self.configure(bg=COLORES["fondo"])
 
+        # Estado global
+        self.fase = "inicio"          # "inicio" | "analizando" | "revision" | "rendering" | "fin"
         self.videos: list[Path] = []
+        self.clips: list[dict] = []   # un dict por clip tras analizar
+        self.clip_sel: int = -1       # índice del clip mostrado en el panel
         self.cola: queue.Queue = queue.Queue()
-        self.procesando = False
 
-        # Pre-carga del modelo Whisper en background: cuando la recepcionista
-        # arrastra el primer vídeo, el modelo ya está cargado (10-15 s ahorrados).
+        # Carpeta temporal para frames, snippets, previews — se borra al cerrar
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="sunview_review_"))
+        self.protocol("WM_DELETE_WINDOW", self._on_cerrar)
+
+        # Pre-carga del modelo Whisper en background
         self._modelo = None
+        self._modelo_error = None
         self._modelo_event = threading.Event()
-
-        self._construir_ui()
-        self._poll_cola()
-
         threading.Thread(target=self._precargar_modelo, daemon=True).start()
 
-    # ── UI ──────────────────────────────────────────────────────────────────
+        # Cache de referencias a PhotoImage (sin esto Tk las garbage-collecta)
+        self._photos: dict = {}
 
-    def _construir_ui(self):
-        # Cabecera
-        cab = tk.Frame(self, bg=COLORES["acento"], pady=14)
+        self._construir_ui_inicio()
+        self._poll_cola()
+        self._bind_atajos()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PRECARGA MODELO
+    # ─────────────────────────────────────────────────────────────────────
+    def _precargar_modelo(self):
+        self._modelo_error = None
+        try:
+            self._modelo, _ = cargar_modelo_whisper()
+        except Exception:
+            import traceback
+            self._modelo_error = traceback.format_exc()
+            self.cola.put(("modelo_error", self._modelo_error))
+        finally:
+            self._modelo_event.set()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # FASE 0 — Inicio: selección de vídeos
+    # ─────────────────────────────────────────────────────────────────────
+    def _construir_ui_inicio(self):
+        self._limpiar_ventana()
+
+        cab = tk.Frame(self, bg=COLORES["acento"], pady=18)
         cab.pack(fill="x")
-        tk.Label(cab, text="Sunview Park", font=(FUENTE, 17, "bold"),
+        tk.Label(cab, text="Sunview Park — Asistente de edición",
+                 font=(FUENTE, 16, "bold"),
                  bg=COLORES["acento"], fg="white").pack()
-        tk.Label(cab, text="Editor automático de vídeos de tirolina",
-                 font=(FUENTE, 10), bg=COLORES["acento"], fg="#BDD7F5").pack()
+        tk.Label(cab,
+                 text="Arrastra los vídeos. La IA analiza, tú validas en segundos.",
+                 font=(FUENTE, 10),
+                 bg=COLORES["acento"], fg="#BDD7F5").pack()
 
-        self.cuerpo = tk.Frame(self, bg=COLORES["fondo"], padx=20, pady=16)
-        self.cuerpo.pack(fill="both", expand=True)
+        cuerpo = tk.Frame(self, bg=COLORES["fondo"], padx=40, pady=30)
+        cuerpo.pack(fill="both", expand=True)
 
-        # Zona de arrastre
-        self.zona = tk.Frame(self.cuerpo, bg=COLORES["panel"],
-                             highlightbackground=COLORES["borde"],
-                             highlightthickness=2)
-        self.zona.pack(fill="x", pady=(0, 10))
+        self.zona_drop = tk.Frame(
+            cuerpo, bg=COLORES["panel"],
+            highlightbackground=COLORES["borde"],
+            highlightthickness=2, height=220,
+        )
+        self.zona_drop.pack(fill="both", expand=True, pady=(0, 20))
+        self.zona_drop.pack_propagate(False)
 
-        msg = "Arrastra los vídeos aquí" if DRAG_DROP else "Selecciona los vídeos"
-        self.lbl_zona = tk.Label(self.zona, text=msg,
-                                  font=(FUENTE, 12), bg=COLORES["panel"],
-                                  fg=COLORES["texto_suave"], pady=18)
-        self.lbl_zona.pack()
+        tk.Label(self.zona_drop, text="📂",
+                 font=(FUENTE, 36), bg=COLORES["panel"],
+                 fg=COLORES["texto_suave"]).pack(pady=(40, 4))
+        msg = ("Arrastra los vídeos aquí"
+               if DRAG_DROP else "Pulsa el botón para seleccionar vídeos")
+        tk.Label(self.zona_drop, text=msg,
+                 font=(FUENTE, 12), bg=COLORES["panel"],
+                 fg=COLORES["texto"]).pack()
+        tk.Label(self.zona_drop, text="o pulsa el botón abajo",
+                 font=(FUENTE, 9), bg=COLORES["panel"],
+                 fg=COLORES["texto_suave"]).pack(pady=(0, 12))
 
-        tk.Button(self.zona, text="Seleccionar vídeos...",
-                  font=(FUENTE, 10), bg=COLORES["acento"], fg="white",
-                  relief="flat", padx=16, pady=6, cursor="hand2",
-                  command=self._seleccionar).pack(pady=(0, 14))
+        self.lbl_seleccion = tk.Label(self.zona_drop, text="",
+                                       font=(FUENTE, 10, "bold"),
+                                       bg=COLORES["panel"],
+                                       fg=COLORES["acento"])
+        self.lbl_seleccion.pack()
 
         if DRAG_DROP:
-            for widget in (self.zona, self.lbl_zona):
-                widget.drop_target_register(DND_FILES)
-                widget.dnd_bind("<<Drop>>", self._on_drop)
+            self.zona_drop.drop_target_register(DND_FILES)
+            self.zona_drop.dnd_bind("<<Drop>>", self._on_drop)
 
-        # Lista de vídeos seleccionados
-        self.frame_lista = tk.Frame(self.cuerpo, bg=COLORES["fondo"])
-        self.frame_lista.pack(fill="x", pady=(0, 10))
+        tk.Button(cuerpo, text="📁  Seleccionar vídeos manualmente",
+                  font=(FUENTE, 10), bg=COLORES["fondo"],
+                  fg=COLORES["acento"], relief="flat", bd=0, cursor="hand2",
+                  command=self._seleccionar).pack(pady=(0, 6))
 
-        # Botón principal
-        self.btn = tk.Button(self.cuerpo, text="Selecciona vídeos para empezar",
-                             font=(FUENTE, 12, "bold"),
-                             bg=COLORES["borde"], fg=COLORES["texto_suave"],
-                             relief="flat", padx=20, pady=10,
-                             state="disabled", command=self._iniciar)
-        self.btn.pack(fill="x", pady=(0, 10))
-
-        # Barra de progreso (oculta hasta que empiece)
-        self.frame_prog = tk.Frame(self.cuerpo, bg=COLORES["fondo"])
-        self.lbl_prog = tk.Label(self.frame_prog, text="",
-                                  font=(FUENTE, 9), bg=COLORES["fondo"],
-                                  fg=COLORES["texto_suave"])
-        self.lbl_prog.pack(anchor="w")
-        self.barra = ttk.Progressbar(self.frame_prog, mode="determinate")
-        self.barra.pack(fill="x", pady=(2, 0))
-
-        # Log de resultados (oculto hasta que empiece)
-        self.frame_log = tk.Frame(self.cuerpo, bg=COLORES["panel"],
-                                   highlightbackground=COLORES["borde"],
-                                   highlightthickness=1)
-        self.log = tk.Text(self.frame_log, height=12, font=("Consolas", 9),
-                            bg=COLORES["panel"], fg=COLORES["texto"],
-                            relief="flat", state="disabled",
-                            wrap="word", padx=8, pady=8)
-        scroll = ttk.Scrollbar(self.frame_log, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        # Botón abrir carpeta (oculto hasta terminar)
-        self.btn_carpeta = tk.Button(self.cuerpo, text="Abrir carpeta de resultados",
-                                      font=(FUENTE, 10, "bold"),
-                                      bg=COLORES["ok"], fg="white",
-                                      relief="flat", padx=16, pady=8,
-                                      cursor="hand2", command=self._abrir_carpeta)
-
-        # Footer discreto con utilidad de mantenimiento. Bajo perfil a propósito:
-        # la recepcionista no debe pulsarlo a diario; sólo cuando alguien técnico
-        # sospecha que el historial está envenenado.
-        self.frame_footer = tk.Frame(self.cuerpo, bg=COLORES["fondo"])
-        self.frame_footer.pack(side="bottom", fill="x", pady=(8, 0))
-        self.lbl_borrar_historial = tk.Label(
-            self.frame_footer,
-            text="Borrar historial de duraciones",
-            font=(FUENTE, 8, "underline"),
-            bg=COLORES["fondo"], fg=COLORES["texto_suave"],
-            cursor="hand2",
+        self.btn_analizar = tk.Button(
+            cuerpo, text="Selecciona vídeos primero",
+            font=(FUENTE, 12, "bold"), height=2,
+            bg=COLORES["borde"], fg=COLORES["texto_suave"],
+            state="disabled", relief="flat", cursor="arrow",
+            command=self._iniciar_analisis,
         )
-        self.lbl_borrar_historial.pack(side="right")
-        self.lbl_borrar_historial.bind("<Button-1>", lambda _e: self._borrar_historial())
-
-    # ── Selección de vídeos ─────────────────────────────────────────────────
+        self.btn_analizar.pack(fill="x")
 
     def _seleccionar(self):
         archivos = filedialog.askopenfilenames(
-            title="Seleccionar vídeos",
-            filetypes=[("Vídeos", "*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV"),
-                       ("Todos los archivos", "*.*")]
+            title="Selecciona vídeos",
+            filetypes=[("Vídeos", "*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV")],
         )
         if archivos:
             self._set_videos([Path(a) for a in archivos])
 
     def _on_drop(self, event):
-        rutas = self.tk.splitlist(event.data)
-        validos = [Path(r) for r in rutas
-                   if Path(r).suffix in EXTENSIONES]
-        if validos:
-            self._set_videos(validos)
+        raw = self.tk.splitlist(event.data)
+        videos = [Path(p) for p in raw
+                  if Path(p).is_file() and Path(p).suffix in EXTENSIONES]
+        if videos:
+            self._set_videos(videos)
 
     def _set_videos(self, videos: list[Path]):
         self.videos = videos
-        for w in self.frame_lista.winfo_children():
-            w.destroy()
-        for v in videos:
-            tk.Label(self.frame_lista, text=f"  • {v.name}",
-                     font=(FUENTE, 9), bg=COLORES["fondo"],
-                     fg=COLORES["texto"]).pack(anchor="w")
-        n = len(videos)
-        self.btn.config(
-            state="normal",
-            bg=COLORES["acento"], fg="white",
-            text=f"Procesar {n} vídeo{'s' if n > 1 else ''}"
-        )
+        if videos:
+            self.lbl_seleccion.config(
+                text=f"{len(videos)} vídeo(s) listo(s) para analizar")
+            self.btn_analizar.config(
+                state="normal",
+                bg=COLORES["acento"], fg="white",
+                text=f"▶  Analizar {len(videos)} vídeo(s)",
+                cursor="hand2",
+            )
 
-    # ── Procesamiento ───────────────────────────────────────────────────────
-
-    def _iniciar(self):
-        if not self.videos or self.procesando:
+    def _iniciar_analisis(self):
+        if not self.videos or self.fase == "analizando":
             return
-        self.procesando = True
-        self.btn.config(state="disabled", bg=COLORES["borde"],
-                        fg=COLORES["texto_suave"], text="Procesando...")
-        CARPETA_SALIDA.mkdir(exist_ok=True)
-
-        # Mostrar barra y log
-        self.frame_prog.pack(fill="x", pady=(0, 8))
-        self.barra["maximum"] = len(self.videos)
-        self.barra["value"] = 0
-        self.frame_log.pack(fill="both", expand=True, pady=(0, 10))
-        self.btn_carpeta.pack_forget()
-
-        threading.Thread(target=self._worker,
-                         args=(list(self.videos),),
-                         daemon=True).start()
-
-    def _precargar_modelo(self):
-        """Carga Whisper en background al abrir la app. Silencioso si triunfa;
-        si falla, _worker hará el segundo intento con log visible."""
         try:
-            self._modelo, _ = cargar_modelo_whisper()
+            self.fase = "analizando"
+            self._construir_ui_analizando()
+            threading.Thread(target=self._worker_analizar_safe,
+                             args=(self.videos,), daemon=True).start()
         except Exception:
-            self._modelo = None
-        finally:
-            self._modelo_event.set()
+            import traceback
+            messagebox.showerror(
+                "Error al iniciar análisis",
+                f"Detalle:\n\n{traceback.format_exc()}",
+            )
+            self.fase = "inicio"
+            self._construir_ui_inicio()
 
-    def _worker(self, videos: list[Path]):
-        # Esperar a que termine la pre-carga (suele estar ya lista).
-        if not self._modelo_event.is_set():
-            self._log("Cargando modelo de IA...\n", "info")
-            self._modelo_event.wait()
+    def _worker_analizar_safe(self, videos):
+        """Wrapper de _worker_analizar que captura cualquier excepción y la
+        muestra en el log de la GUI en vez de morir silenciosamente."""
+        try:
+            self._worker_analizar(videos)
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            self.cola.put(("log", (f"\n✗ ERROR FATAL EN WORKER:\n{tb}\n", "error")))
+            # Permitir reset
+            self.cola.put(("fin_analisis", []))
 
+    # ─────────────────────────────────────────────────────────────────────
+    # FASE 1 — Análisis: progreso por clip
+    # ─────────────────────────────────────────────────────────────────────
+    def _construir_ui_analizando(self):
+        self._limpiar_ventana()
+        cuerpo = tk.Frame(self, bg=COLORES["fondo"], padx=40, pady=40)
+        cuerpo.pack(fill="both", expand=True)
+
+        tk.Label(cuerpo, text="Analizando vídeos...",
+                 font=(FUENTE, 16, "bold"),
+                 bg=COLORES["fondo"], fg=COLORES["texto"]).pack(pady=(0, 8))
+        self.lbl_prog = tk.Label(cuerpo, text="Preparando...",
+                                  font=(FUENTE, 10),
+                                  bg=COLORES["fondo"],
+                                  fg=COLORES["texto_suave"])
+        self.lbl_prog.pack(pady=(0, 16))
+
+        self.barra = ttk.Progressbar(cuerpo, orient="horizontal",
+                                      length=720, mode="determinate",
+                                      maximum=len(self.videos))
+        self.barra.pack(pady=(0, 24))
+
+        self.log = tk.Text(cuerpo, height=14, font=(FUENTE, 9),
+                           bg="#1A1A1A", fg="#E0E0E0",
+                           relief="flat", padx=10, pady=8)
+        self.log.pack(fill="both", expand=True)
+        for nivel, color in [("ok", "#7DD081"), ("aviso", "#F0B848"),
+                              ("error", "#E84A4A"), ("info", "#E0E0E0"),
+                              ("header", "#7AB7FF")]:
+            self.log.tag_config(nivel, foreground=color)
+        self.log.config(state="disabled")
+
+    def _worker_analizar(self, videos):
+        """Hilo: analiza cada vídeo y produce un dict por clip.
+
+        Para cada vídeo: valida → extrae audio (PERMANENTE durante revisión)
+        → transcribe → sugiere corte → extrae 3 frames + onda. Si algún
+        paso falla, se incluye el clip con `error` para que el usuario lo
+        vea pero no se pueda renderizar.
+        """
+        self.cola.put(("log", ("Cargando modelo de IA...\n", "info")))
+        self._modelo_event.wait()
         if self._modelo is None:
-            # La pre-carga falló: reintentar con log visible para diagnóstico.
-            self._log("Cargando modelo de IA...\n", "info")
-            try:
-                def _log_modelo(nivel, msg):
-                    self._log(f"  {msg}\n", nivel)
-                self._modelo, _ = cargar_modelo_whisper(log=_log_modelo)
-            except RuntimeError as exc:
-                self._log(f"{exc}\n", "error")
-                self.cola.put(("fin", []))
-                return
-            self._log("\n", "info")
+            msg = (self._modelo_error or
+                   "Whisper no se pudo cargar (causa desconocida).")
+            self.cola.put(("log", (f"✗ {msg}\n", "error")))
+            # Generar clips-error para que la pantalla siguiente muestre el motivo
+            clips_err = [self._clip_error(v, f"Whisper no cargó: {msg}")
+                          for v in videos]
+            self.cola.put(("fin_analisis", clips_err))
+            return
+        self.cola.put(("log", ("✓ Modelo listo.\n\n", "ok")))
 
-        model = self._modelo
-
-        resultados = []
-
+        clips = []
         for i, video in enumerate(videos, 1):
-            self.cola.put(("prog_label", f"[{i}/{len(videos)}] {video.name}"))
-            self._log(f"{'─'*45}\n{video.name}\n", "header")
-            duracion = 0
-            t0, t1 = 0, 0
-            salida = CARPETA_SALIDA / f"{video.stem}_FINAL.mp4"
+            self.cola.put(("prog_label",
+                           f"[{i}/{len(videos)}] {video.name}"))
+            self.cola.put(("log",
+                           (f"\n── {video.name} ──\n", "header")))
 
-            # Validación previa: detecta sin audio, OneDrive placeholder, corrupto
             ok_val, motivo = validar_video(video)
             if not ok_val:
-                self._log(f"⚠ No se puede procesar: {motivo}\n\n", "error")
-                resultados.append({
-                    "nombre": video.name, "ok": False, "detalle": motivo,
-                    "necesita_ajuste": False, "video_path": video,
-                    "salida_path": salida, "duracion": 0, "t0": 0, "t1": 0,
-                })
+                self.cola.put(("log", (f"  ⚠ {motivo}\n", "aviso")))
+                clips.append(self._clip_error(video, motivo))
                 self.cola.put(("prog_barra", i))
                 continue
 
-            # Temporal por vídeo: el context manager garantiza el borrado
-            # aunque haya excepción a mitad del procesamiento.
-            with audio_temp_file() as audio_tmp:
-                try:
-                    self._log("Extrayendo audio...\n", "info")
-                    extraer_audio(video, audio_tmp)
-                    duracion = obtener_duracion(video)
+            try:
+                # WAV temporal de este clip — vive hasta cerrar la app
+                audio_tmp = self.tmp_dir / f"{video.stem}.wav"
+                self.cola.put(("log", ("  Extrayendo audio...\n", "info")))
+                extraer_audio(video, audio_tmp)
+                duracion = obtener_duracion(video)
 
-                    self._log("Transcribiendo con IA...\n", "info")
-                    # Callback de progreso: la transcripción es el paso más largo
-                    # y sin feedback parece colgada. Muestra % en la etiqueta superior.
-                    def _prog_transcripcion(pct, _texto):
-                        self.cola.put((
-                            "prog_label",
-                            f"[{i}/{len(videos)}] {video.name} — transcribiendo {pct}%",
-                        ))
-                    tx = transcribir_audio(audio_tmp, model, on_segment=_prog_transcripcion)
+                self.cola.put(("log", ("  Transcribiendo...\n", "info")))
+                tx = transcribir_audio(audio_tmp, self._modelo)
 
-                    txt_path = CARPETA_SALIDA / f"{video.stem}_transcripcion.txt"
-                    with open(txt_path, "w", encoding="utf-8") as f:
-                        for seg in tx["segments"]:
-                            f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
+                txt_path = CARPETA_SALIDA / f"{video.stem}_transcripcion.txt"
+                CARPETA_SALIDA.mkdir(exist_ok=True)
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    for seg in tx["segments"]:
+                        f.write(f"[{seg['start']:6.2f}s - {seg['end']:6.2f}s] {seg['text']}\n")
 
-                    self._log("Analizando energía de audio...\n", "info")
-                    # Lógica compartida con CLI — cualquier mejora se aplica aquí también.
-                    corte = resolver_corte(tx, duracion, audio_tmp)
-                    for nivel, msg in corte["logs"]:
-                        self._log(f"{msg}\n", nivel)
+                self.cola.put(("log", ("  Sugiriendo corte...\n", "info")))
+                sug = sugerir_corte(tx, duracion, audio_tmp)
+                for nivel, msg in sug["logs"]:
+                    self.cola.put(("log", (f"    {msg}\n", nivel)))
 
-                    # "Sin vuelo": no generar salida, pero ofrecer ajuste manual
-                    if corte["sin_vuelo"]:
-                        self._log(
-                            "⚠ No se detectó ningún vuelo en este clip.\n"
-                            "  Si es un vídeo de instrucciones o prueba, ignóralo.\n"
-                            "  Si crees que sí hay vuelo, ajústalo manualmente abajo.\n\n",
-                            "aviso",
-                        )
-                        resultados.append({
-                            "nombre": video.name, "ok": False,
-                            "detalle": "sin vuelo detectado",
-                            "necesita_ajuste": True, "video_path": video,
-                            "salida_path": salida, "duracion": duracion,
-                            "t0": 0, "t1": duracion,
-                        })
-                        self.cola.put(("prog_barra", i))
-                        continue
+                # Sugerencias con márgenes aplicados (lo que se cortaría)
+                t0_sug = (max(0.0, sug["t_inicio_raw"] - SEGUNDOS_ANTES_INICIO)
+                          if sug["t_inicio_raw"] is not None else 0.0)
+                t1_sug = (min(duracion, sug["t_fin_raw"] + SEGUNDOS_DESPUES_FIN)
+                          if sug["t_fin_raw"] is not None else duracion)
 
-                    t0, t1 = corte["t_inicio"], corte["t_fin"]
-                    t0_raw, t1_raw = corte["t_inicio_raw"], corte["t_fin_raw"]
-                    txt0, txt1 = corte["texto_inicio"], corte["texto_fin"]
+                # Storyboard + onda
+                self.cola.put(("log", ("  Generando storyboard...\n", "info")))
+                frame_paths = extraer_3_frames(
+                    video, t0_sug, self.tmp_dir, ancho=ANCHO_FRAME,
+                )
+                rms, _ = envolvente_rms(audio_tmp, n_puntos=800)
 
-                    if t0_raw is not None and txt0 != "[audio]":
-                        self._log(f"✓ Salida:  '{txt0.strip()}' → {segundos_a_mmss(t0_raw)}\n", "ok")
-                    elif t0_raw is None:
-                        self._log("⚠ Inicio no detectado — lo que oyó Whisper al principio:\n", "aviso")
-                        # Mostrar la primera mitad como pista de qué dijo el monitor.
-                        limite = duracion * 0.5
-                        segs = [s for s in tx["segments"] if s["start"] <= limite and s["text"].strip()]
-                        for s in segs:
-                            self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
+                clips.append({
+                    "video_path": video,
+                    "audio_tmp": audio_tmp,
+                    "duracion": duracion,
+                    "t_inicio_raw": sug["t_inicio_raw"],
+                    "t_fin_raw": sug["t_fin_raw"],
+                    "texto_inicio": sug["texto_inicio"] or "(no detectado)",
+                    "texto_fin": sug["texto_fin"] or "(no detectado)",
+                    "t0": t0_sug,
+                    "t1": t1_sug,
+                    "rms": rms,
+                    "frame_paths": frame_paths,
+                    "ok": False,
+                    "rendered": False,
+                    "error": None,
+                    "render_error": None,
+                })
+                self.cola.put(("log",
+                               (f"  ✓ Sugerencia: {segundos_a_mmss(t0_sug)} → "
+                                f"{segundos_a_mmss(t1_sug)} ({t1_sug - t0_sug:.0f}s)\n",
+                                "ok")))
+            except Exception as exc:
+                import traceback
+                self.cola.put(("log",
+                               (f"  ✗ Error: {exc}\n{traceback.format_exc()}\n",
+                                "error")))
+                clips.append(self._clip_error(video, str(exc)))
 
-                    if corte.get("fin_sintetizado"):
-                        self._log(
-                            f"⚠ Llegada SINTETIZADA: '{txt1.strip()}' → "
-                            f"{segundos_a_mmss(t1_raw)}\n",
-                            "aviso",
-                        )
-                        self._log(
-                            "  (sin voz ni caída del viento — revisa el corte manualmente)\n",
-                            "aviso",
-                        )
-                    elif t1_raw is not None and txt1 != "[audio]":
-                        self._log(f"✓ Llegada: '{txt1.strip()}' → {segundos_a_mmss(t1_raw)}\n", "ok")
-                    elif t1_raw is None:
-                        self._log("⚠ Llegada no detectada — lo que oyó Whisper al final:\n", "aviso")
-                        limite_fin = duracion * 0.70
-                        segs = [s for s in tx["segments"] if s["start"] >= limite_fin and s["text"].strip()]
-                        if segs:
-                            for s in segs:
-                                self._log(f"    [{segundos_a_mmss(s['start'])}] {s['text'].strip()}\n", "info")
-                        else:
-                            self._log("    (sin audio detectado en el último 30%)\n", "info")
-
-                    self._log(f"Corte: {segundos_a_mmss(t0)} → {segundos_a_mmss(t1)} "
-                              f"({t1 - t0:.0f}s)\n", "info")
-
-                    self._log("Generando vídeo final...\n", "info")
-                    try:
-                        editar_video(video, t0, t1, salida)
-                    except Exception:
-                        salida.unlink(missing_ok=True)
-                        raise
-
-                    self._log("Verificando...\n", "info")
-                    checks = verificar_corte(salida)
-                    for ch_nombre, ch_ok, ch_det in checks:
-                        self._log(
-                            f"  {'✓' if ch_ok else '⚠'} {ch_nombre}: {ch_det}\n",
-                            "ok" if ch_ok else "aviso",
-                        )
-                    ok = all(ch_ok for _, ch_ok, _ in checks)
-                    fin_sint = bool(corte.get("fin_sintetizado"))
-                    detalle = (
-                        " | ".join(f"{n}:{d}" for n, ch_ok, d in checks if not ch_ok)
-                        or "OK"
-                    )
-                    # Fin sintetizado: aunque los checks técnicos pasen, el
-                    # corte se hizo sin evidencia física del fin → siempre se
-                    # marca para revisión manual con anotación visible.
-                    if fin_sint:
-                        detalle = (
-                            f"{detalle} · ⚠ fin sintetizado — revisar"
-                            if detalle != "OK"
-                            else "⚠ fin sintetizado — revisar"
-                        )
-                    self._log(("\n" if ok else "⚠ Revisa los puntos marcados arriba.\n\n"), "aviso" if not ok else "info")
-                    resultados.append({
-                        "nombre": video.name,
-                        "ok": ok and not fin_sint,
-                        "detalle": detalle,
-                        "necesita_ajuste": (not ok) or fin_sint,
-                        "fin_sintetizado": fin_sint,
-                        "video_path": video,
-                        "salida_path": salida,
-                        "duracion": duracion,
-                        "t0": t0,
-                        "t1": t1,
-                    })
-
-                except Exception as exc:
-                    import traceback
-                    tb = traceback.format_exc()
-                    self._log(f"✗ Error: {exc}\n{tb}\n", "error")
-                    resultados.append({
-                        "nombre": video.name,
-                        "ok": False,
-                        "detalle": str(exc),
-                        "necesita_ajuste": False,
-                        "video_path": video,
-                        "salida_path": salida,
-                        "duracion": duracion,
-                        "t0": t0,
-                        "t1": t1,
-                    })
-
-            # Progreso siempre, esté procesado o no — fuera del with para
-            # que se actualice incluso si el cleanup del audio temporal aún
-            # no ha completado (context manager lo gestiona).
             self.cola.put(("prog_barra", i))
 
-        self.cola.put(("fin", resultados))
+        self.cola.put(("fin_analisis", clips))
 
-    # ── Cola UI ─────────────────────────────────────────────────────────────
-
-    def _log(self, texto: str, nivel: str = "info"):
-        self.cola.put(("log", texto, nivel))
-
-    def _poll_cola(self):
-        colores_log = {
-            "ok":     COLORES["ok"],
-            "aviso":  COLORES["aviso"],
-            "error":  COLORES["error"],
-            "header": COLORES["acento"],
-            "info":   COLORES["texto"],
+    def _clip_error(self, video, motivo):
+        return {
+            "video_path": video, "audio_tmp": None, "duracion": 0,
+            "t_inicio_raw": None, "t_fin_raw": None,
+            "texto_inicio": "", "texto_fin": "",
+            "t0": 0.0, "t1": 0.0, "rms": None, "frame_paths": {},
+            "ok": False, "rendered": False, "error": motivo,
+            "render_error": None,
         }
-        try:
-            while True:
-                msg = self.cola.get_nowait()
-                if msg[0] == "log":
-                    _, texto, nivel = msg
-                    self.log.config(state="normal")
-                    tag = f"c_{nivel}"
-                    self.log.tag_config(tag, foreground=colores_log.get(nivel, COLORES["texto"]))
-                    self.log.insert("end", texto, tag)
-                    self.log.see("end")
-                    self.log.config(state="disabled")
-                elif msg[0] == "prog_label":
-                    self.lbl_prog.config(text=msg[1])
-                elif msg[0] == "prog_barra":
-                    self.barra["value"] = msg[1]
-                elif msg[0] == "estado":
-                    _, widget, texto, color = msg
-                    widget.config(text=texto, fg=color)
-                elif msg[0] == "fin":
-                    self._on_fin(msg[1])
-        except queue.Empty:
-            pass
-        self.after(100, self._poll_cola)
 
-    def _on_fin(self, resultados: list):
-        self.procesando = False
-        if not resultados:
-            self.btn.config(state="normal", bg=COLORES["acento"], fg="white",
-                            text="Selecciona vídeos para empezar")
+    # ─────────────────────────────────────────────────────────────────────
+    # FASE 2 — Revisión: lista + detalle con storyboard, onda, controles
+    # ─────────────────────────────────────────────────────────────────────
+    def _entrar_revision(self, clips):
+        self.clips = clips
+        # Si no hay clips O todos tienen error → no entramos en revisión;
+        # mostramos un resumen con la causa y permitimos volver al inicio.
+        clips_validos = [c for c in clips if not c.get("error")]
+        if not clips_validos:
+            self._mostrar_ui_sin_clips_validos(clips)
             return
-        n_ok = sum(1 for r in resultados if r["ok"])
-        n = len(resultados)
-        self._log(f"{'='*45}\n", "header")
-        self._log(f"RESULTADO: {n_ok}/{n} vídeos correctos\n", "header")
-        for r in resultados:
-            self._log(f"  {'✓' if r['ok'] else '⚠'} {r['nombre']}: {r['detalle']}\n",
-                      "ok" if r["ok"] else "aviso")
-        if any(not r["ok"] for r in resultados):
-            self._log("\nLos vídeos marcados con ⚠ pueden necesitar revisión.\n", "aviso")
+        self.fase = "revision"
+        self._construir_ui_revision()
+        # Seleccionar el primer clip válido
+        for i, c in enumerate(clips):
+            if c.get("error") is None:
+                self._seleccionar_clip(i)
+                return
 
-        self.lbl_prog.config(text=f"Completado — {n_ok}/{n} vídeos correctos")
-        self.btn_carpeta.pack(fill="x", pady=(4, 0))
+    def _mostrar_ui_sin_clips_validos(self, clips):
+        """Pantalla informativa cuando ningún vídeo pasa la fase de análisis."""
+        self.fase = "fin"
+        self._limpiar_ventana()
+        cuerpo = tk.Frame(self, bg=COLORES["fondo"], padx=40, pady=40)
+        cuerpo.pack(fill="both", expand=True)
+        tk.Label(cuerpo, text="No hay vídeos para revisar",
+                 font=(FUENTE, 16, "bold"),
+                 bg=COLORES["fondo"], fg=COLORES["error"]).pack(pady=(0, 8))
+        if clips:
+            tk.Label(
+                cuerpo,
+                text=(f"Los {len(clips)} vídeo(s) seleccionado(s) fallaron "
+                       "durante el análisis. Detalle:"),
+                font=(FUENTE, 10), bg=COLORES["fondo"],
+                fg=COLORES["texto_suave"]).pack(pady=(0, 14))
+            lista = tk.Text(cuerpo, height=12, font=(FUENTE, 9),
+                             bg="#1A1A1A", fg="#E0E0E0",
+                             relief="flat", padx=10, pady=8)
+            lista.pack(fill="both", expand=True)
+            for c in clips:
+                lista.insert("end",
+                              f"✗ {c['video_path'].name}: {c.get('error', '?')}\n")
+            lista.config(state="disabled")
+        else:
+            tk.Label(
+                cuerpo,
+                text="No se ha analizado ningún vídeo.",
+                font=(FUENTE, 10), bg=COLORES["fondo"],
+                fg=COLORES["texto_suave"]).pack(pady=(0, 14))
 
-        ajustes = [r for r in resultados if r["necesita_ajuste"]]
-        if ajustes:
-            self._mostrar_panel_ajuste(ajustes)
+        tk.Button(cuerpo, text="↻ Volver al inicio",
+                  font=(FUENTE, 11, "bold"),
+                  bg=COLORES["acento"], fg="white",
+                  relief="flat", cursor="hand2", padx=18, pady=6,
+                  command=self._reset).pack(pady=(20, 0))
 
-    # ── Panel de ajuste manual ───────────────────────────────────────────────
+    def _construir_ui_revision(self):
+        self._limpiar_ventana()
 
-    def _mostrar_panel_ajuste(self, ajustes: list):
-        frame = tk.LabelFrame(
-            self.cuerpo, text="Ajuste manual de corte",
-            font=(FUENTE, 10, "bold"),
-            bg=COLORES["fondo"], fg=COLORES["aviso"],
-            bd=1, relief="groove", padx=10, pady=8,
+        # Cabecera
+        cab = tk.Frame(self, bg=COLORES["acento"], pady=10)
+        cab.pack(fill="x")
+        tk.Label(cab, text="Revisión rápida — aprueba o ajusta cada clip",
+                 font=(FUENTE, 14, "bold"),
+                 bg=COLORES["acento"], fg="white").pack(side="left", padx=16)
+        self.lbl_atajos = tk.Label(
+            cab,
+            text="↑↓ navegar  ←→ ±1s inicio  Enter aprobar  Espacio audio  V vídeo",
+            font=(FUENTE, 9), bg=COLORES["acento"], fg="#BDD7F5",
         )
-        frame.pack(fill="x", pady=(10, 0))
+        self.lbl_atajos.pack(side="right", padx=16)
 
-        tk.Label(frame,
-                 text="La detección automática falló en estos vídeos. "
-                      "Edita los tiempos y pulsa Cortar.",
-                 font=(FUENTE, 9), bg=COLORES["fondo"],
-                 fg=COLORES["texto_suave"], wraplength=600, justify="left",
-                 ).pack(anchor="w", pady=(0, 6))
+        # Cuerpo: izquierda lista, derecha detalle
+        cuerpo = tk.Frame(self, bg=COLORES["fondo"])
+        cuerpo.pack(fill="both", expand=True)
 
-        for r in ajustes:
-            self._fila_ajuste(frame, r)
+        # Lista
+        izq = tk.Frame(cuerpo, bg=COLORES["panel"], width=260)
+        izq.pack(side="left", fill="y", padx=(8, 4), pady=8)
+        izq.pack_propagate(False)
+        tk.Label(izq, text="Vídeos", font=(FUENTE, 11, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["texto"]).pack(pady=(6, 4))
 
-    def _fila_ajuste(self, frame, r: dict):
-        fila = tk.Frame(frame, bg=COLORES["fondo"])
-        fila.pack(fill="x", pady=4)
+        self.lista_frame = tk.Frame(izq, bg=COLORES["panel"])
+        self.lista_frame.pack(fill="both", expand=True, padx=4)
+        self._refrescar_lista()
 
-        nombre = r["nombre"]
-        if len(nombre) > 22:
-            nombre = nombre[:19] + "..."
-        tk.Label(fila, text=nombre, font=(FUENTE, 9, "bold"),
-                 bg=COLORES["fondo"], fg=COLORES["texto"],
-                 width=24, anchor="w").pack(side="left")
+        # Detalle
+        der = tk.Frame(cuerpo, bg=COLORES["fondo"])
+        der.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
 
-        tk.Label(fila, text="Inicio:", font=(FUENTE, 9),
-                 bg=COLORES["fondo"], fg=COLORES["texto_suave"]).pack(side="left")
-        var_t0 = tk.StringVar(value=segundos_a_mmss(r["t0"]))
-        tk.Entry(fila, textvariable=var_t0, font=(FUENTE, 9),
-                 width=7).pack(side="left", padx=(2, 10))
+        self.detalle = tk.Frame(der, bg=COLORES["panel"])
+        self.detalle.pack(fill="both", expand=True)
 
-        tk.Label(fila, text="Fin:", font=(FUENTE, 9),
-                 bg=COLORES["fondo"], fg=COLORES["texto_suave"]).pack(side="left")
-        var_t1 = tk.StringVar(value=segundos_a_mmss(r["t1"]))
-        tk.Entry(fila, textvariable=var_t1, font=(FUENTE, 9),
-                 width=7).pack(side="left", padx=(2, 10))
+        # Footer: contador + botón generar
+        pie = tk.Frame(self, bg=COLORES["fondo"], pady=10)
+        pie.pack(fill="x", padx=8, pady=(0, 8))
+        self.lbl_contador = tk.Label(pie, text="",
+                                       font=(FUENTE, 10),
+                                       bg=COLORES["fondo"],
+                                       fg=COLORES["texto_suave"])
+        self.lbl_contador.pack(side="left", padx=16)
+        self.btn_render = tk.Button(
+            pie, text="Generar vídeos aprobados",
+            font=(FUENTE, 11, "bold"), bg=COLORES["ok"], fg="white",
+            relief="flat", cursor="hand2", padx=18, pady=6,
+            command=self._iniciar_render,
+        )
+        self.btn_render.pack(side="right", padx=16)
+        self._refrescar_contador()
 
-        lbl_estado = tk.Label(fila, text="", font=(FUENTE, 9),
-                               bg=COLORES["fondo"], fg=COLORES["texto_suave"])
-        lbl_estado.pack(side="left")
+    def _refrescar_lista(self):
+        for w in self.lista_frame.winfo_children():
+            w.destroy()
+        for i, c in enumerate(self.clips):
+            fila = tk.Frame(
+                self.lista_frame,
+                bg=COLORES["panel_sel"] if i == self.clip_sel else COLORES["panel"],
+                cursor="hand2", pady=2,
+            )
+            fila.pack(fill="x", pady=1)
+            if c.get("error"):
+                icono = "✗"
+                color = COLORES["error"]
+            elif c.get("ok"):
+                icono = "✓"
+                color = COLORES["ok"]
+            else:
+                icono = "•"
+                color = COLORES["texto_suave"]
+            tk.Label(fila, text=icono, font=(FUENTE, 11, "bold"),
+                     bg=fila.cget("bg"), fg=color, width=2).pack(side="left")
+            nombre = c["video_path"].name
+            if len(nombre) > 22:
+                nombre = nombre[:20] + "…"
+            tk.Label(fila, text=nombre, font=(FUENTE, 9),
+                     bg=fila.cget("bg"), fg=COLORES["texto"],
+                     anchor="w").pack(side="left", fill="x", expand=True)
+            fila.bind("<Button-1>", lambda e, idx=i: self._seleccionar_clip(idx))
+            for child in fila.winfo_children():
+                child.bind("<Button-1>", lambda e, idx=i: self._seleccionar_clip(idx))
 
-        tk.Button(
-            fila, text="Cortar",
-            font=(FUENTE, 9, "bold"),
-            bg=COLORES["acento"], fg="white",
-            relief="flat", padx=12, pady=3, cursor="hand2",
-            command=lambda: self._recutar(r, var_t0, var_t1, lbl_estado),
-        ).pack(side="right")
+    def _refrescar_contador(self):
+        if not hasattr(self, "lbl_contador"):
+            return
+        ok = sum(1 for c in self.clips if c.get("ok") and not c.get("error"))
+        rev = sum(1 for c in self.clips if not c.get("ok") and not c.get("error"))
+        err = sum(1 for c in self.clips if c.get("error"))
+        partes = [f"{ok} aprobados", f"{rev} por revisar"]
+        if err:
+            partes.append(f"{err} con error")
+        self.lbl_contador.config(text="  ·  ".join(partes))
+        self.btn_render.config(
+            text=f"Generar {ok} vídeo(s) aprobados" if ok else "Aprueba al menos uno",
+            state="normal" if ok > 0 else "disabled",
+            bg=COLORES["ok"] if ok > 0 else COLORES["borde"],
+            fg="white" if ok > 0 else COLORES["texto_suave"],
+            cursor="hand2" if ok > 0 else "arrow",
+        )
 
-    def _recutar(self, r: dict, var_t0: tk.StringVar, var_t1: tk.StringVar,
-                 lbl_estado: tk.Label):
+    def _seleccionar_clip(self, idx):
+        if not (0 <= idx < len(self.clips)):
+            return
+        self.clip_sel = idx
+        self._refrescar_lista()
+        self._mostrar_detalle(self.clips[idx])
+
+    def _mostrar_detalle(self, c: dict):
+        for w in self.detalle.winfo_children():
+            w.destroy()
+        self._photos.clear()  # liberar referencias del clip anterior
+
+        cont = tk.Frame(self.detalle, bg=COLORES["panel"], padx=18, pady=14)
+        cont.pack(fill="both", expand=True)
+
+        # Nombre + estado
+        cab = tk.Frame(cont, bg=COLORES["panel"])
+        cab.pack(fill="x", pady=(0, 8))
+        tk.Label(cab, text=c["video_path"].name,
+                 font=(FUENTE, 12, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["texto"]).pack(side="left")
+
+        if c.get("error"):
+            tk.Label(cont, text=f"⚠ {c['error']}",
+                     font=(FUENTE, 10),
+                     bg=COLORES["panel"], fg=COLORES["error"],
+                     wraplength=820, justify="left",
+                     ).pack(anchor="w", pady=10)
+            return
+
+        # ── Storyboard de 3 frames ──
+        storyboard = tk.Frame(cont, bg=COLORES["panel"])
+        storyboard.pack(pady=(0, 10))
+        etiquetas = [
+            ("antes", f"-{int(2)}s antes"),
+            ("inicio", "INICIO"),
+            ("despues", f"+{int(2)}s después"),
+        ]
+        for clave, texto in etiquetas:
+            celda = tk.Frame(storyboard, bg=COLORES["panel"], padx=6)
+            celda.pack(side="left")
+            tk.Label(celda, text=texto,
+                     font=(FUENTE, 9, "bold"),
+                     bg=COLORES["panel"],
+                     fg=COLORES["acento"] if clave == "inicio" else COLORES["texto_suave"],
+                     ).pack()
+            path = c["frame_paths"].get(clave) if c.get("frame_paths") else None
+            if path and Path(path).exists():
+                img = Image.open(path)
+                img.thumbnail((ANCHO_FRAME, ALTO_FRAME), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._photos[clave] = photo
+                tk.Label(celda, image=photo,
+                         bg=COLORES["panel"]).pack()
+            else:
+                tk.Label(celda, text="(sin frame)",
+                         width=int(ANCHO_FRAME / 8), height=int(ALTO_FRAME / 16),
+                         bg=COLORES["borde"], fg=COLORES["texto_suave"],
+                         font=(FUENTE, 9)).pack()
+
+        # ── Waveform ──
+        wf_frame = tk.Frame(cont, bg=COLORES["panel"])
+        wf_frame.pack(fill="x", pady=(4, 10))
+        self._dibujar_waveform(wf_frame, c)
+
+        # ── Controles ──
+        controles = tk.Frame(cont, bg=COLORES["panel"])
+        controles.pack(fill="x", pady=(0, 6))
+
+        # Variables editables del clip seleccionado
+        self.var_t0 = tk.StringVar(value=segundos_a_mmss(c["t0"]))
+        self.var_t1 = tk.StringVar(value=segundos_a_mmss(c["t1"]))
+
+        fila_ini = tk.Frame(controles, bg=COLORES["panel"])
+        fila_ini.pack(fill="x", pady=2)
+        tk.Label(fila_ini, text="Inicio", font=(FUENTE, 10, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["marcador_ini"], width=7,
+                 anchor="w").pack(side="left")
+        ent_t0 = tk.Entry(fila_ini, textvariable=self.var_t0, width=8,
+                           font=(FUENTE, 11), justify="center")
+        ent_t0.pack(side="left", padx=4)
+        ent_t0.bind("<Return>", lambda e: self._aplicar_tiempos())
+        tk.Button(fila_ini, text="−1s", font=(FUENTE, 9),
+                  bg=COLORES["fondo"], relief="flat", cursor="hand2",
+                  command=lambda: self._ajustar_t0(-1)).pack(side="left", padx=2)
+        tk.Button(fila_ini, text="+1s", font=(FUENTE, 9),
+                  bg=COLORES["fondo"], relief="flat", cursor="hand2",
+                  command=lambda: self._ajustar_t0(+1)).pack(side="left", padx=2)
+        tk.Label(fila_ini, text=f"  pista: {c.get('texto_inicio') or '—'}",
+                 font=(FUENTE, 9), bg=COLORES["panel"],
+                 fg=COLORES["texto_suave"]).pack(side="left", padx=8)
+
+        fila_fin = tk.Frame(controles, bg=COLORES["panel"])
+        fila_fin.pack(fill="x", pady=2)
+        tk.Label(fila_fin, text="Fin", font=(FUENTE, 10, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["marcador_fin"], width=7,
+                 anchor="w").pack(side="left")
+        ent_t1 = tk.Entry(fila_fin, textvariable=self.var_t1, width=8,
+                           font=(FUENTE, 11), justify="center")
+        ent_t1.pack(side="left", padx=4)
+        ent_t1.bind("<Return>", lambda e: self._aplicar_tiempos())
+        tk.Button(fila_fin, text="−1s", font=(FUENTE, 9),
+                  bg=COLORES["fondo"], relief="flat", cursor="hand2",
+                  command=lambda: self._ajustar_t1(-1)).pack(side="left", padx=2)
+        tk.Button(fila_fin, text="+1s", font=(FUENTE, 9),
+                  bg=COLORES["fondo"], relief="flat", cursor="hand2",
+                  command=lambda: self._ajustar_t1(+1)).pack(side="left", padx=2)
+        tk.Label(fila_fin, text=f"  pista: {c.get('texto_fin') or '—'}",
+                 font=(FUENTE, 9), bg=COLORES["panel"],
+                 fg=COLORES["texto_suave"]).pack(side="left", padx=8)
+
+        # Duración
+        dur = c["t1"] - c["t0"]
+        self.lbl_duracion = tk.Label(
+            controles,
+            text=f"Duración del corte: {dur:.0f}s",
+            font=(FUENTE, 10),
+            bg=COLORES["panel"], fg=COLORES["texto_suave"],
+        )
+        self.lbl_duracion.pack(anchor="w", pady=(6, 0))
+
+        # Acciones
+        acciones = tk.Frame(cont, bg=COLORES["panel"])
+        acciones.pack(fill="x", pady=(10, 0))
+
+        tk.Button(acciones, text="🔊 Audio (Espacio)",
+                  font=(FUENTE, 10), bg=COLORES["fondo"],
+                  fg=COLORES["texto"], relief="flat", cursor="hand2",
+                  command=self._reproducir_audio).pack(side="left", padx=(0, 6))
+        tk.Button(acciones, text="🎬 Ver vídeo (V)",
+                  font=(FUENTE, 10), bg=COLORES["fondo"],
+                  fg=COLORES["texto"], relief="flat", cursor="hand2",
+                  command=self._abrir_video_externo).pack(side="left", padx=6)
+
+        self.btn_ok = tk.Button(
+            acciones,
+            text="✓ Aprobar (Enter)" if not c.get("ok") else "✓ Aprobado · desmarcar",
+            font=(FUENTE, 11, "bold"),
+            bg=COLORES["ok"] if not c.get("ok") else COLORES["aviso"],
+            fg="white", relief="flat", cursor="hand2", padx=14, pady=4,
+            command=self._toggle_ok,
+        )
+        self.btn_ok.pack(side="right")
+
+    def _dibujar_waveform(self, parent, c: dict):
+        rms = c.get("rms")
+        duracion = c["duracion"]
+        if rms is None or len(rms) == 0 or duracion <= 0:
+            tk.Label(parent, text="(sin onda disponible)",
+                     bg=COLORES["panel"],
+                     fg=COLORES["texto_suave"]).pack()
+            return
+
+        fig = Figure(figsize=(10, 1.6), dpi=80)
+        fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.22)
+        ax = fig.add_subplot(111)
+
+        n = len(rms)
+        x = [i * duracion / n for i in range(n)]
+        ax.fill_between(x, 0, rms, color=COLORES["acento"], alpha=0.55, linewidth=0)
+        ax.plot(x, rms, color=COLORES["acento"], linewidth=0.6)
+
+        # Marcadores de inicio y fin (guardamos las refs para movernos sin
+        # redibujar la onda entera al ajustar t0/t1).
+        self._wf_marker_ini = ax.axvline(
+            c["t0"], color=COLORES["marcador_ini"], linewidth=2)
+        self._wf_marker_fin = ax.axvline(
+            c["t1"], color=COLORES["marcador_fin"], linewidth=2)
+
+        ax.set_xlim(0, duracion)
+        ax.set_ylim(0, max(0.05, float(rms.max()) * 1.05))
+        ax.set_yticks([])
+        ax.set_xlabel("tiempo (s)", fontsize=8)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.grid(axis="x", color="#E0E0E0", linewidth=0.5)
+        ax.set_facecolor(COLORES["panel"])
+        fig.patch.set_facecolor(COLORES["panel"])
+
+        self._wf_canvas = FigureCanvasTkAgg(fig, master=parent)
+        widget = self._wf_canvas.get_tk_widget()
+        widget.pack(fill="x")
+        widget.bind("<Button-1>",
+                    lambda e: self._click_waveform(e, ax, duracion))
+        self._wf_fig = fig
+        self._wf_ax = ax
+        self._wf_canvas.draw()
+
+    def _click_waveform(self, evt, ax, duracion):
+        """Click izquierdo → mueve t_inicio; Shift+click → mueve t_fin."""
+        widget = evt.widget
+        ancho = widget.winfo_width()
+        if ancho <= 0:
+            return
+        # Convertir coords de tkinter a coords de datos vía matplotlib
+        x_norm = evt.x / ancho
+        # ax tiene margen — usamos su posición en la figura
+        bbox = ax.get_position()
+        x_dentro = (x_norm - bbox.x0) / (bbox.x1 - bbox.x0)
+        if not (0.0 <= x_dentro <= 1.0):
+            return
+        t = x_dentro * duracion
+        c = self.clips[self.clip_sel]
+        if evt.state & 0x0001:  # Shift
+            c["t1"] = max(c["t0"] + 0.5, min(duracion, t))
+        else:
+            c["t0"] = max(0.0, min(c["t1"] - 0.5, t))
+        self.var_t0.set(segundos_a_mmss(c["t0"]))
+        self.var_t1.set(segundos_a_mmss(c["t1"]))
+        self._actualizar_marcadores_waveform(c)
+        self._actualizar_duracion_label(c)
+
+    def _actualizar_marcadores_waveform(self, c: dict):
+        if not hasattr(self, "_wf_marker_ini"):
+            return
+        self._wf_marker_ini.set_xdata([c["t0"], c["t0"]])
+        self._wf_marker_fin.set_xdata([c["t1"], c["t1"]])
+        self._wf_canvas.draw_idle()
+
+    def _actualizar_duracion_label(self, c: dict):
+        if hasattr(self, "lbl_duracion"):
+            self.lbl_duracion.config(
+                text=f"Duración del corte: {c['t1'] - c['t0']:.0f}s")
+
+    # ── Acciones sobre el clip seleccionado ──
+    def _clip_actual(self):
+        if 0 <= self.clip_sel < len(self.clips):
+            c = self.clips[self.clip_sel]
+            if not c.get("error"):
+                return c
+        return None
+
+    def _ajustar_t0(self, delta):
+        c = self._clip_actual()
+        if c is None:
+            return
+        c["t0"] = max(0.0, min(c["t1"] - 0.5, c["t0"] + delta))
+        self.var_t0.set(segundos_a_mmss(c["t0"]))
+        self._actualizar_marcadores_waveform(c)
+        self._actualizar_duracion_label(c)
+
+    def _ajustar_t1(self, delta):
+        c = self._clip_actual()
+        if c is None:
+            return
+        c["t1"] = max(c["t0"] + 0.5, min(c["duracion"], c["t1"] + delta))
+        self.var_t1.set(segundos_a_mmss(c["t1"]))
+        self._actualizar_marcadores_waveform(c)
+        self._actualizar_duracion_label(c)
+
+    def _aplicar_tiempos(self):
+        """Lee los Entry y actualiza el clip."""
+        c = self._clip_actual()
+        if c is None:
+            return
         try:
-            t0 = self._mmss_a_segundos(var_t0.get())
-            t1 = self._mmss_a_segundos(var_t1.get())
+            t0 = _mmss_a_segundos(self.var_t0.get())
+            t1 = _mmss_a_segundos(self.var_t1.get())
         except ValueError:
-            lbl_estado.config(text="Formato inválido (usa M:SS)", fg=COLORES["error"])
+            messagebox.showwarning("Formato", "Usa formato m:ss (ej. 1:42)")
             return
-
-        if t1 <= t0:
-            lbl_estado.config(text="Fin debe ser mayor que Inicio", fg=COLORES["error"])
+        if t1 - t0 < 0.5:
+            messagebox.showwarning("Tiempos", "El fin debe ser posterior al inicio")
             return
+        c["t0"] = max(0.0, min(c["duracion"], t0))
+        c["t1"] = max(c["t0"] + 0.5, min(c["duracion"], t1))
+        self._actualizar_marcadores_waveform(c)
+        self._actualizar_duracion_label(c)
 
-        lbl_estado.config(text="Cortando...", fg=COLORES["texto_suave"])
-        self.update_idletasks()
+    def _toggle_ok(self):
+        c = self._clip_actual()
+        if c is None:
+            return
+        self._aplicar_tiempos()  # asegura que los Entry editados se aplican
+        c["ok"] = not c.get("ok")
+        self._refrescar_lista()
+        self._refrescar_contador()
+        # Refrescar botón de aprobación
+        self._mostrar_detalle(c)
 
-        def _do():
+    def _reproducir_audio(self):
+        """Espacio → reproduce 6 s del audio centrado en t0."""
+        c = self._clip_actual()
+        if c is None or c.get("audio_tmp") is None:
+            return
+        t0_pre = max(0.0, c["t0"] - PREVIEW_DUR_S / 2)
+        snippet = self.tmp_dir / f"_preview_{c['video_path'].stem}.wav"
+        if extraer_audio_snippet(c["audio_tmp"], t0_pre, PREVIEW_DUR_S, snippet):
             try:
-                editar_video(r["video_path"], t0, t1, r["salida_path"])
-                # Re-verificar con los mismos 5 agentes que el corte automático
-                checks = verificar_corte(r["salida_path"])
-                n_ok = sum(1 for _, c_ok, _ in checks if c_ok)
-                n = len(checks)
-                if n_ok == n:
-                    self.cola.put(("estado", lbl_estado,
-                                   f"✓ {n_ok}/{n} ({t1 - t0:.0f}s)", COLORES["ok"]))
-                else:
-                    fallos = ", ".join(nom for nom, c_ok, _ in checks if not c_ok)
-                    self.cola.put(("estado", lbl_estado,
-                                   f"⚠ {n_ok}/{n} (falla: {fallos})", COLORES["aviso"]))
+                winsound.PlaySound(
+                    str(snippet),
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                )
+            except RuntimeError:
+                pass
+
+    def _abrir_video_externo(self):
+        """V → genera clip de 6 s y abre con reproductor por defecto."""
+        c = self._clip_actual()
+        if c is None:
+            return
+        t0_pre = max(0.0, c["t0"] - PREVIEW_DUR_S / 2)
+        clip_out = self.tmp_dir / f"_preview_{c['video_path'].stem}.mp4"
+        ok = extraer_clip_preview(c["video_path"], t0_pre, PREVIEW_DUR_S, clip_out)
+        if ok:
+            try:
+                os.startfile(str(clip_out))
+            except OSError as e:
+                messagebox.showerror("Reproductor",
+                                      f"No se pudo abrir el preview: {e}")
+
+    def _aprobar_y_siguiente(self):
+        c = self._clip_actual()
+        if c is None:
+            return
+        self._aplicar_tiempos()
+        c["ok"] = True
+        self._refrescar_lista()
+        self._refrescar_contador()
+        # Avanzar al primer no-aprobado
+        n = len(self.clips)
+        for j in range(1, n + 1):
+            idx = (self.clip_sel + j) % n
+            if (not self.clips[idx].get("ok")
+                    and not self.clips[idx].get("error")):
+                self._seleccionar_clip(idx)
+                return
+        # Todos aprobados: refrescar la vista del actual
+        self._mostrar_detalle(c)
+
+    def _navegar(self, delta):
+        if not self.clips:
+            return
+        n = len(self.clips)
+        nuevo = (self.clip_sel + delta) % n
+        self._seleccionar_clip(nuevo)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # FASE 3 — Render: genera vídeos aprobados
+    # ─────────────────────────────────────────────────────────────────────
+    def _iniciar_render(self):
+        aprobados = [c for c in self.clips
+                     if c.get("ok") and not c.get("error")]
+        if not aprobados:
+            return
+        if self.fase == "rendering":
+            return
+        self.fase = "rendering"
+        CARPETA_SALIDA.mkdir(exist_ok=True)
+        self._construir_ui_rendering(len(aprobados))
+        threading.Thread(target=self._worker_render,
+                         args=(aprobados,), daemon=True).start()
+
+    def _construir_ui_rendering(self, total):
+        self._limpiar_ventana()
+        cuerpo = tk.Frame(self, bg=COLORES["fondo"], padx=40, pady=40)
+        cuerpo.pack(fill="both", expand=True)
+        tk.Label(cuerpo, text="Generando vídeos finales...",
+                 font=(FUENTE, 16, "bold"),
+                 bg=COLORES["fondo"], fg=COLORES["texto"]).pack(pady=(0, 8))
+        self.lbl_prog = tk.Label(cuerpo, text="Preparando...",
+                                  font=(FUENTE, 10),
+                                  bg=COLORES["fondo"],
+                                  fg=COLORES["texto_suave"])
+        self.lbl_prog.pack(pady=(0, 16))
+        self.barra = ttk.Progressbar(cuerpo, orient="horizontal",
+                                      length=720, mode="determinate",
+                                      maximum=total)
+        self.barra.pack(pady=(0, 24))
+        self.log = tk.Text(cuerpo, height=16, font=(FUENTE, 9),
+                           bg="#1A1A1A", fg="#E0E0E0",
+                           relief="flat", padx=10, pady=8)
+        self.log.pack(fill="both", expand=True)
+        for nivel, color in [("ok", "#7DD081"), ("aviso", "#F0B848"),
+                              ("error", "#E84A4A"), ("info", "#E0E0E0"),
+                              ("header", "#7AB7FF")]:
+            self.log.tag_config(nivel, foreground=color)
+        self.log.config(state="disabled")
+
+    def _worker_render(self, aprobados):
+        for i, c in enumerate(aprobados, 1):
+            self.cola.put(("prog_label",
+                           f"[{i}/{len(aprobados)}] {c['video_path'].name}"))
+            self.cola.put(("log",
+                           (f"\n── {c['video_path'].name} ──\n", "header")))
+            salida = CARPETA_SALIDA / f"{c['video_path'].stem}_FINAL.mp4"
+            try:
+                editar_video(c["video_path"], c["t0"], c["t1"], salida)
+                self.cola.put(("log",
+                               (f"  ✓ Generado: {salida.name}\n", "ok")))
+                checks = verificar_corte(salida)
+                for nombre, chk_ok, det in checks:
+                    self.cola.put((
+                        "log",
+                        (f"    {'✓' if chk_ok else '⚠'} {nombre}: {det}\n",
+                         "ok" if chk_ok else "aviso"),
+                    ))
+                c["rendered"] = True
+                c["salida"] = salida
             except Exception as exc:
-                self.cola.put(("estado", lbl_estado,
-                               f"✗ {exc}", COLORES["error"]))
+                self.cola.put(("log", (f"  ✗ Error: {exc}\n", "error")))
+                salida.unlink(missing_ok=True)
+                c["render_error"] = str(exc)
+            self.cola.put(("prog_barra", i))
+        self.cola.put(("fin_render", aprobados))
 
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _mmss_a_segundos(self, texto: str) -> float:
-        texto = texto.strip()
-        if ":" in texto:
-            partes = texto.split(":", 1)
-            return int(partes[0]) * 60 + float(partes[1])
-        return float(texto)
+    def _on_fin_render(self, aprobados):
+        ok = sum(1 for c in aprobados if c.get("rendered"))
+        err = [c for c in aprobados if c.get("render_error")]
+        self.lbl_prog.config(text=f"Completado — {ok}/{len(aprobados)} vídeos generados")
+        if err:
+            self._append_log(f"\n⚠ {len(err)} vídeo(s) fallaron al renderizar:\n", "aviso")
+            for c in err:
+                self._append_log(f"  · {c['video_path'].name}: {c['render_error']}\n",
+                                  "error")
+        # Botón final para volver al inicio + abrir carpeta
+        pie = tk.Frame(self, bg=COLORES["fondo"])
+        pie.pack(fill="x", pady=10)
+        tk.Button(pie, text="📂 Abrir carpeta salida/",
+                  font=(FUENTE, 10), bg=COLORES["acento"], fg="white",
+                  relief="flat", cursor="hand2", padx=14, pady=6,
+                  command=self._abrir_carpeta).pack(side="left", padx=16)
+        tk.Button(pie, text="↻ Procesar más vídeos",
+                  font=(FUENTE, 10), bg=COLORES["fondo"], fg=COLORES["acento"],
+                  relief="flat", cursor="hand2", padx=14, pady=6,
+                  command=self._reset).pack(side="right", padx=16)
 
     def _abrir_carpeta(self):
-        carpeta = CARPETA_SALIDA.absolute()
-        carpeta.mkdir(exist_ok=True)
-        os.startfile(str(carpeta))
+        try:
+            os.startfile(str(CARPETA_SALIDA))
+        except OSError:
+            pass
 
-    def _borrar_historial(self):
-        """Limpia historial_vuelos.json tras confirmar con el usuario.
+    def _reset(self):
+        self.videos = []
+        self.clips = []
+        self.clip_sel = -1
+        self.fase = "inicio"
+        self._construir_ui_inicio()
 
-        Confirmación obligatoria (showinfo+askyesno) porque borrar el historial
-        hace que el fallback fin-anclado vuelva a usar el defecto de 60 s hasta
-        que se acumulen ≥3 detecciones nuevas — efecto visible.
-        """
-        durs = _cargar_historial_duraciones()
-        if not durs:
-            messagebox.showinfo(
-                "Historial vacío",
-                "No hay duraciones guardadas todavía.\n"
-                f"({HISTORIAL_VUELOS_FILE.name} no existe.)",
-                parent=self,
-            )
+    # ─────────────────────────────────────────────────────────────────────
+    # Atajos de teclado globales
+    # ─────────────────────────────────────────────────────────────────────
+    def _bind_atajos(self):
+        self.bind("<Up>", lambda e: self._navegar(-1) if self.fase == "revision" else None)
+        self.bind("<Down>", lambda e: self._navegar(+1) if self.fase == "revision" else None)
+        self.bind("<Left>", self._on_izq)
+        self.bind("<Right>", self._on_der)
+        self.bind("<Return>", lambda e: self._aprobar_y_siguiente() if self.fase == "revision" else None)
+        self.bind("<space>", lambda e: self._reproducir_audio() if self.fase == "revision" else None)
+        self.bind("v", lambda e: self._abrir_video_externo() if self.fase == "revision" else None)
+        self.bind("V", lambda e: self._abrir_video_externo() if self.fase == "revision" else None)
+
+    def _on_izq(self, e):
+        if self.fase != "revision":
             return
-
-        from statistics import median
-        mediana = median(durs) if durs else 0
-        confirmado = messagebox.askyesno(
-            "Borrar historial de duraciones",
-            f"Hay {len(durs)} duraciones guardadas "
-            f"(mediana actual {mediana:.0f}s).\n\n"
-            "Al borrarlas, el fallback fin-anclado volverá a usar el valor por "
-            "defecto (60s) hasta que vuelvan a acumularse ≥3 detecciones.\n\n"
-            "¿Borrar?",
-            parent=self,
-        )
-        if not confirmado:
+        # Si el foco está en el Entry, dejar al Entry mover el cursor
+        w = self.focus_get()
+        if isinstance(w, tk.Entry):
             return
+        self._ajustar_t0(-1)
 
-        if borrar_historial_duraciones():
-            messagebox.showinfo(
-                "Historial borrado",
-                "El historial se ha borrado correctamente.",
-                parent=self,
-            )
-        else:
-            messagebox.showerror(
-                "Error",
-                f"No se pudo borrar {HISTORIAL_VUELOS_FILE}.\n"
-                "Comprueba permisos del archivo.",
-                parent=self,
-            )
+    def _on_der(self, e):
+        if self.fase != "revision":
+            return
+        w = self.focus_get()
+        if isinstance(w, tk.Entry):
+            return
+        self._ajustar_t0(+1)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Polling de cola para comunicación con workers
+    # ─────────────────────────────────────────────────────────────────────
+    def _poll_cola(self):
+        try:
+            while True:
+                tipo, data = self.cola.get_nowait()
+                if tipo == "log":
+                    self._append_log(*data)
+                elif tipo == "prog_label":
+                    if hasattr(self, "lbl_prog"):
+                        self.lbl_prog.config(text=data)
+                elif tipo == "prog_barra":
+                    if hasattr(self, "barra"):
+                        self.barra["value"] = data
+                elif tipo == "fin_analisis":
+                    self._entrar_revision(data)
+                elif tipo == "fin_render":
+                    self._on_fin_render(data)
+                elif tipo == "modelo_error":
+                    pass  # se logueará al iniciar análisis
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_cola)
+
+    def _append_log(self, texto: str, nivel: str = "info"):
+        if not hasattr(self, "log"):
+            return
+        self.log.config(state="normal")
+        self.log.insert("end", texto, nivel)
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Limpieza
+    # ─────────────────────────────────────────────────────────────────────
+    def _limpiar_ventana(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+    def _on_cerrar(self):
+        try:
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        except OSError:
+            pass
+        self.destroy()
+
+
+def _mmss_a_segundos(texto: str) -> float:
+    """Parsea 'm:ss' o 'ss' a segundos. Lanza ValueError si malformado."""
+    texto = texto.strip()
+    if ":" in texto:
+        m, s = texto.split(":", 1)
+        return int(m) * 60 + float(s)
+    return float(texto)
+
+
+def main():
+    app = App()
+    app.mainloop()
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()

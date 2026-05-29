@@ -1,3 +1,5 @@
 faster-whisper>=1.0.0
 tkinterdnd2
 numpy
+Pillow>=10.0.0
+matplotlib>=3.7.0
