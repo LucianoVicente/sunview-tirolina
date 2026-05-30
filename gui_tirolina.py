@@ -61,7 +61,8 @@ from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
     editar_video, verificar_corte, validar_video,
     sugerir_corte, cargar_modelo_whisper,
-    extraer_3_frames, extraer_audio_snippet, extraer_clip_preview,
+    extraer_3_frames, extraer_frames_grid, frame_mas_cercano,
+    extraer_audio_snippet, extraer_clip_preview,
     envolvente_rms,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES,
     SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
@@ -350,11 +351,17 @@ class App(BaseVentana):
                 t1_sug = (min(duracion, sug["t_fin_raw"] + SEGUNDOS_DESPUES_FIN)
                           if sug["t_fin_raw"] is not None else duracion)
 
-                # Storyboard + onda
-                self.cola.put(("log", ("  Generando storyboard...\n", "info")))
-                frame_paths = extraer_3_frames(
-                    video, t0_sug, self.tmp_dir, ancho=ANCHO_FRAME,
+                # Storyboard (rejilla 1 frame/s) + onda
+                self.cola.put(("log", ("  Generando rejilla de frames...\n", "info")))
+                grid_dir = Path(self.tmp_dir) / f"{Path(video).stem}_grid"
+                frames_grid = extraer_frames_grid(
+                    video, grid_dir, ancho=ANCHO_FRAME, paso_s=1.0,
                 )
+                if not frames_grid:
+                    # Fallback: 3 frames sueltos alrededor del t0 sugerido
+                    self.cola.put(("log",
+                                   ("  ⚠ Rejilla vacía, usando 3 frames sueltos\n",
+                                    "warn")))
                 rms, _ = envolvente_rms(audio_tmp, n_puntos=800)
 
                 clips.append({
@@ -368,7 +375,7 @@ class App(BaseVentana):
                     "t0": t0_sug,
                     "t1": t1_sug,
                     "rms": rms,
-                    "frame_paths": frame_paths,
+                    "frames_grid": frames_grid,
                     "ok": False,
                     "rendered": False,
                     "error": None,
@@ -394,7 +401,7 @@ class App(BaseVentana):
             "video_path": video, "audio_tmp": None, "duracion": 0,
             "t_inicio_raw": None, "t_fin_raw": None,
             "texto_inicio": "", "texto_fin": "",
-            "t0": 0.0, "t1": 0.0, "rms": None, "frame_paths": {},
+            "t0": 0.0, "t1": 0.0, "rms": None, "frames_grid": {},
             "ok": False, "rendered": False, "error": motivo,
             "render_error": None,
         }
@@ -589,13 +596,14 @@ class App(BaseVentana):
                      ).pack(anchor="w", pady=10)
             return
 
-        # ── Storyboard de 3 frames ──
+        # ── Storyboard de 3 frames (refrescable desde rejilla) ──
         storyboard = tk.Frame(cont, bg=COLORES["panel"])
         storyboard.pack(pady=(0, 10))
+        self._storyboard_labels = {}
         etiquetas = [
-            ("antes", f"-{int(2)}s antes"),
+            ("antes", "-5s antes"),
             ("inicio", "INICIO"),
-            ("despues", f"+{int(2)}s después"),
+            ("despues", "+5s después"),
         ]
         for clave, texto in etiquetas:
             celda = tk.Frame(storyboard, bg=COLORES["panel"], padx=6)
@@ -605,19 +613,13 @@ class App(BaseVentana):
                      bg=COLORES["panel"],
                      fg=COLORES["acento"] if clave == "inicio" else COLORES["texto_suave"],
                      ).pack()
-            path = c["frame_paths"].get(clave) if c.get("frame_paths") else None
-            if path and Path(path).exists():
-                img = Image.open(path)
-                img.thumbnail((ANCHO_FRAME, ALTO_FRAME), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self._photos[clave] = photo
-                tk.Label(celda, image=photo,
-                         bg=COLORES["panel"]).pack()
-            else:
-                tk.Label(celda, text="(sin frame)",
-                         width=int(ANCHO_FRAME / 8), height=int(ALTO_FRAME / 16),
-                         bg=COLORES["borde"], fg=COLORES["texto_suave"],
-                         font=(FUENTE, 9)).pack()
+            lbl_img = tk.Label(celda, bg=COLORES["borde"],
+                                width=int(ANCHO_FRAME / 8),
+                                height=int(ALTO_FRAME / 16),
+                                fg=COLORES["texto_suave"], font=(FUENTE, 9))
+            lbl_img.pack()
+            self._storyboard_labels[clave] = lbl_img
+        self._refrescar_storyboard(c, c["t0"])
 
         # ── Waveform ──
         wf_frame = tk.Frame(cont, bg=COLORES["panel"])
@@ -641,12 +643,12 @@ class App(BaseVentana):
                            font=(FUENTE, 11), justify="center")
         ent_t0.pack(side="left", padx=4)
         ent_t0.bind("<Return>", lambda e: self._aplicar_tiempos())
-        tk.Button(fila_ini, text="−1s", font=(FUENTE, 9),
+        tk.Button(fila_ini, text="−5s", font=(FUENTE, 9),
                   bg=COLORES["fondo"], relief="flat", cursor="hand2",
-                  command=lambda: self._ajustar_t0(-1)).pack(side="left", padx=2)
-        tk.Button(fila_ini, text="+1s", font=(FUENTE, 9),
+                  command=lambda: self._ajustar_t0(-5)).pack(side="left", padx=2)
+        tk.Button(fila_ini, text="+5s", font=(FUENTE, 9),
                   bg=COLORES["fondo"], relief="flat", cursor="hand2",
-                  command=lambda: self._ajustar_t0(+1)).pack(side="left", padx=2)
+                  command=lambda: self._ajustar_t0(+5)).pack(side="left", padx=2)
         tk.Label(fila_ini, text=f"  pista: {c.get('texto_inicio') or '—'}",
                  font=(FUENTE, 9), bg=COLORES["panel"],
                  fg=COLORES["texto_suave"]).pack(side="left", padx=8)
@@ -660,12 +662,12 @@ class App(BaseVentana):
                            font=(FUENTE, 11), justify="center")
         ent_t1.pack(side="left", padx=4)
         ent_t1.bind("<Return>", lambda e: self._aplicar_tiempos())
-        tk.Button(fila_fin, text="−1s", font=(FUENTE, 9),
+        tk.Button(fila_fin, text="−5s", font=(FUENTE, 9),
                   bg=COLORES["fondo"], relief="flat", cursor="hand2",
-                  command=lambda: self._ajustar_t1(-1)).pack(side="left", padx=2)
-        tk.Button(fila_fin, text="+1s", font=(FUENTE, 9),
+                  command=lambda: self._ajustar_t1(-5)).pack(side="left", padx=2)
+        tk.Button(fila_fin, text="+5s", font=(FUENTE, 9),
                   bg=COLORES["fondo"], relief="flat", cursor="hand2",
-                  command=lambda: self._ajustar_t1(+1)).pack(side="left", padx=2)
+                  command=lambda: self._ajustar_t1(+5)).pack(side="left", padx=2)
         tk.Label(fila_fin, text=f"  pista: {c.get('texto_fin') or '—'}",
                  font=(FUENTE, 9), bg=COLORES["panel"],
                  fg=COLORES["texto_suave"]).pack(side="left", padx=8)
@@ -769,6 +771,7 @@ class App(BaseVentana):
         self.var_t1.set(segundos_a_mmss(c["t1"]))
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
+        self._refrescar_storyboard(c, c["t0"])
 
     def _actualizar_marcadores_waveform(self, c: dict):
         if not hasattr(self, "_wf_marker_ini"):
@@ -798,6 +801,7 @@ class App(BaseVentana):
         self.var_t0.set(segundos_a_mmss(c["t0"]))
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
+        self._refrescar_storyboard(c, c["t0"])
 
     def _ajustar_t1(self, delta):
         c = self._clip_actual()
@@ -826,6 +830,38 @@ class App(BaseVentana):
         c["t1"] = max(c["t0"] + 0.5, min(c["duracion"], t1))
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
+        self._refrescar_storyboard(c, c["t0"])
+
+    def _refrescar_storyboard(self, c: dict, t_centro: float):
+        """Actualiza las 3 miniaturas (t-2, t, t+2) desde la rejilla pre-extraída.
+
+        Si no hay rejilla, deja los placeholders. Mantiene una caché de PhotoImages
+        en self._photos para evitar que el GC libere la imagen mostrada.
+        """
+        labels = getattr(self, "_storyboard_labels", None)
+        if not labels:
+            return
+        grid = c.get("frames_grid") or {}
+        offsets = {"antes": -5.0, "inicio": 0.0, "despues": 5.0}
+        for clave, lbl in labels.items():
+            t = max(0.0, t_centro + offsets[clave])
+            path = frame_mas_cercano(grid, t)
+            if path and Path(path).exists():
+                try:
+                    img = Image.open(path)
+                    img.thumbnail((ANCHO_FRAME, ALTO_FRAME), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                except Exception:
+                    photo = None
+            else:
+                photo = None
+            if photo is not None:
+                self._photos[clave] = photo  # ancla anti-GC
+                lbl.config(image=photo, text="", width=0, height=0)
+            else:
+                lbl.config(image="", text="(sin frame)",
+                           width=int(ANCHO_FRAME / 8),
+                           height=int(ALTO_FRAME / 16))
 
     def _toggle_ok(self):
         c = self._clip_actual()

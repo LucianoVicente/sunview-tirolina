@@ -374,6 +374,76 @@ def extraer_3_frames(video_path, t_inicio_s, out_dir, ancho=240, gap_s=2.0):
     return resultados
 
 
+def extraer_frames_grid(video_path, out_dir, ancho=240, paso_s=1.0):
+    """Pre-extrae una rejilla de frames de todo el vídeo (un frame cada `paso_s`).
+
+    Permite a la GUI refrescar el storyboard al instante cuando el revisor mueve
+    t0/t1, sin nuevas llamadas a ffmpeg. Una sola pasada con `fps=1/paso_s` es
+    mucho más rápida que N seeks independientes.
+
+    Devuelve dict {segundo_int: Path} con todos los frames disponibles. Si la
+    extracción falla, devuelve {} (la GUI debe degradar a 3 frames sueltos).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fps = 1.0 / max(0.1, float(paso_s))
+    patron = str(out_dir / "grid_%05d.jpg")
+    # `-hwaccel auto` deja a ffmpeg escoger DXVA2/D3D11/CUDA según GPU; en
+    # GoPro H.264 reduce la decodificación ~4x. Si no hay GPU disponible
+    # ffmpeg degrada a CPU sin fallar.
+    cmd = [
+        "ffmpeg", "-y", "-hwaccel", "auto", "-i", str(video_path),
+        "-vf", f"fps={fps},scale={int(ancho)}:-2",
+        "-q:v", "4",
+        patron,
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS,
+    )
+    if result.returncode != 0:
+        # Reintento sin hwaccel por si el "auto" elegido no soporta el codec
+        cmd_cpu = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", f"fps={fps},scale={int(ancho)}:-2",
+            "-q:v", "4",
+            patron,
+        ]
+        result = subprocess.run(
+            cmd_cpu, capture_output=True, text=True,
+            creationflags=SUBPROCESS_FLAGS,
+        )
+        if result.returncode != 0:
+            return {}
+    # ffmpeg numera 00001, 00002, ...; el frame N corresponde al segundo
+    # (N-1) * paso_s del vídeo (frame 1 = t=0, frame 2 = t=paso_s, ...).
+    grid = {}
+    for path in sorted(out_dir.glob("grid_*.jpg")):
+        try:
+            idx = int(path.stem.split("_")[1])
+        except (ValueError, IndexError):
+            continue
+        t = (idx - 1) * float(paso_s)
+        grid[int(round(t))] = path
+    return grid
+
+
+def frame_mas_cercano(grid, t_s):
+    """Devuelve el Path del frame de la rejilla más cercano a t_s, o None.
+
+    La rejilla puede tener huecos al final (si ffmpeg corta antes); buscamos
+    el segundo entero más cercano disponible para no devolver None por 0.4s.
+    """
+    if not grid:
+        return None
+    t_int = int(round(float(t_s)))
+    if t_int in grid:
+        return grid[t_int]
+    # Búsqueda del entero más cercano disponible
+    claves = sorted(grid.keys())
+    mejor = min(claves, key=lambda k: abs(k - t_int))
+    return grid[mejor]
+
+
 def extraer_audio_snippet(audio_path, t0_s, duracion_s, out_path):
     """Recorta un trozo del WAV de audio temporal para reproducirlo.
 
