@@ -24,22 +24,31 @@ if errorlevel 1 (
 echo [OK] Python encontrado
 python --version
 
-REM Comprobar FFmpeg
+REM Comprobar FFmpeg: vale la carpeta local "ffmpeg\bin" dentro de la app
+REM (sin tocar el PATH de Windows) o el PATH del sistema.
+if exist "ffmpeg\bin\ffmpeg.exe" (
+    echo [OK] FFmpeg encontrado ^(carpeta local de la app^)
+    goto ffmpeg_ok
+)
 where ffmpeg >nul 2>&1
 if errorlevel 1 (
     echo.
     echo [ERROR] FFmpeg no encontrado.
     echo.
-    echo Descargalo desde: https://www.gyan.dev/ffmpeg/builds/
-    echo Elige "ffmpeg-release-essentials.zip", descomprime en C:\ffmpeg
-    echo y anade C:\ffmpeg\bin a la variable PATH del sistema.
+    echo   1. Descarga "ffmpeg-release-essentials.zip" de:
+    echo      https://www.gyan.dev/ffmpeg/builds/
+    echo   2. Descomprimelo y renombra la carpeta resultante a "ffmpeg"
+    echo   3. Mueve esa carpeta DENTRO de esta carpeta de la app
+    echo      ^(debe quedar: ffmpeg\bin\ffmpeg.exe^)
+    echo   4. No hace falta tocar el PATH: la app la encuentra sola.
     echo.
-    echo Despues de instalarlo, vuelve a ejecutar este archivo.
+    echo Despues vuelve a ejecutar este archivo.
     echo.
     pause
     exit /b 1
 )
-echo [OK] FFmpeg encontrado
+echo [OK] FFmpeg encontrado ^(PATH del sistema^)
+:ffmpeg_ok
 
 REM Crear entorno virtual
 echo.
@@ -81,11 +90,24 @@ if errorlevel 1 (
     echo [AVISO] No se descargo el modelo ahora. Se descargara la primera vez que uses el programa.
 )
 
+REM Archivos privados (van por USB, nunca por GitHub)
+echo.
+if not exist "config_sheets.json" (
+    echo [AVISO] Falta config_sheets.json. Copialo a esta carpeta desde el USB,
+    echo         junto con la clave del robot ^(sunviewparkvideos-*.json^).
+    echo         Sin ellos la app funciona, pero no rellena el email del cliente.
+) else (
+    echo [OK] config_sheets.json presente
+)
+
+REM Acceso directo en el escritorio
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0crear_acceso_directo.ps1"
+
 echo.
 echo ============================================================
 echo   INSTALACION COMPLETADA
 echo ============================================================
 echo.
-echo Para editar videos haz doble clic en:  editar.bat
+echo Abre la app con el icono "Sunview Videos" del escritorio.
 echo.
 pause

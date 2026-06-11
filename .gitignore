@@ -41,6 +41,9 @@ __pycache__/
 # Claude Code (configuración local del asistente)
 .claude/
 
+# ffmpeg portátil descomprimido dentro de la app (cada PC descarga el suyo)
+ffmpeg/
+
 # Notas y capturas locales de prueba (no van al repo)
 codigo_revision.txt
 fotos prueba/

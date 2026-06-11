@@ -76,7 +76,14 @@ def _cargar_config():
         raise ClientesError(f"No se pudo leer config_sheets.json: {exc}") from exc
 
     sa = cfg.get("service_account_json")
-    if not sa or not Path(sa).exists():
+    if sa:
+        # Ruta relativa = relativa a la carpeta de la app, no al cwd. Así el
+        # config puede llevar solo el nombre del .json y vale en cualquier PC.
+        sa_path = Path(sa)
+        if not sa_path.is_absolute():
+            sa_path = _BASE / sa_path
+        cfg["service_account_json"] = str(sa_path)
+    if not sa or not Path(cfg["service_account_json"]).exists():
         raise ClientesError(
             "La clave de la cuenta de servicio (service_account_json) no existe "
             f"en la ruta indicada: {sa!r}"

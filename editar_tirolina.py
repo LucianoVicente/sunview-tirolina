@@ -84,6 +84,13 @@ EXTENSIONES = (".mp4", ".mov", ".avi", ".mkv")
 # no existe y se queda en 0 (no-op).
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+# ffmpeg portátil: si junto a la app hay una carpeta ffmpeg\bin con los .exe
+# (basta descomprimir el build de gyan.dev ahí), se antepone al PATH del
+# proceso. Así el PC de recepción no necesita tocar el PATH de Windows.
+_FFMPEG_LOCAL = Path(__file__).resolve().parent / "ffmpeg" / "bin"
+if (_FFMPEG_LOCAL / "ffmpeg.exe").exists():
+    os.environ["PATH"] = str(_FFMPEG_LOCAL) + os.pathsep + os.environ.get("PATH", "")
+
 # Orden de fallback si el modelo principal no cabe en RAM/VRAM.
 # small ≈ 1.5 GB, base ≈ 0.5 GB, tiny ≈ 0.2 GB.
 MODELOS_WHISPER_FALLBACK = ["small", "base", "tiny"]
