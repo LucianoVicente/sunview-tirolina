@@ -1176,12 +1176,17 @@ class App(BaseVentana):
                 self._append_log(f"  · {c['video_path'].name}: {c['render_error']}\n",
                                   "error")
         renderizados = [c for c in aprobados if c.get("rendered")]
-        if renderizados:
-            self._construir_panel_entrega(renderizados)
 
-        # Botón final para volver al inicio + abrir carpeta
+        # El render terminó: encoger su registro para dejar sitio al panel
+        # de entrega (el detalle sigue ahí, con scroll).
+        self.log.config(height=5)
+
+        # Botón final para volver al inicio + abrir carpeta. Se empaqueta
+        # ANTES que el panel de entrega y anclado abajo: en pack, los widgets
+        # tardíos son los primeros en quedarse sin sitio, y este pie quedaba
+        # fuera de la ventana cuando la lista de vídeos era larga.
         pie = tk.Frame(self, bg=COLORES["fondo"])
-        pie.pack(fill="x", pady=10)
+        pie.pack(side="bottom", fill="x", pady=10)
         tk.Button(pie, text="📂 Abrir carpeta salida/",
                   font=(FUENTE, 10), bg=COLORES["acento"], fg="white",
                   relief="flat", cursor="hand2", padx=14, pady=6,
@@ -1190,6 +1195,9 @@ class App(BaseVentana):
                   font=(FUENTE, 10), bg=COLORES["fondo"], fg=COLORES["acento"],
                   relief="flat", cursor="hand2", padx=14, pady=6,
                   command=self._reset).pack(side="right", padx=16)
+
+        if renderizados:
+            self._construir_panel_entrega(renderizados)
 
     # ─────────────────────────────────────────────────────────────────────
     # FASE 3b — Entrega: por cada vídeo, subir a WeTransfer + abrir Gmail
