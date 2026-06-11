@@ -1,0 +1,13 @@
+{
+    "service_account_json": "C:/ruta/a/tu/service_account.json",
+    "spreadsheet_id": "OPCIONAL_solo_de_respaldo_la_app_encuentra_la_hoja_del_mes_sola",
+    "remitente_correo": "tucuenta@gmail.com",
+    "entrega_metodo": "gofile",
+    "drive_retencion_dias": 7,
+    "columnas": {
+        "orden": 1,
+        "videos": 2,
+        "email": 3,
+        "nombre": 3
+    }
+}

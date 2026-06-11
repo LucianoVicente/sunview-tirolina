@@ -75,7 +75,8 @@ PRESET = "medium"
 LOGO_ESCALA = 0.65  # tamaño del logo
 LOGO_MARGEN = 60   # distancia desde la esquina en píxeles
 
-EXTENSIONES = (".mp4", ".mov", ".MP4", ".MOV", ".avi", ".AVI", ".mkv", ".MKV")
+# Comparar siempre con suffix.lower(): cubre .MP4, .Mp4, .mkV, etc.
+EXTENSIONES = (".mp4", ".mov", ".avi", ".mkv")
 
 # En Windows, cada subprocess.run lanzando ffmpeg/ffprobe abre una ventana de
 # consola visible que parpadea (especialmente molesto desde la GUI, que procesa
@@ -144,7 +145,13 @@ def cargar_modelo_whisper(preferido=None, log=None):
         if log is not None:
             log(nivel, msg)
         else:
-            print(f"  {'⚠' if nivel == 'aviso' else '✓'} {msg}")
+            try:
+                print(f"  {'⚠' if nivel == 'aviso' else '✓'} {msg}")
+            except (UnicodeEncodeError, OSError, ValueError):
+                # stdout cp1252 o cerrado: informar nunca debe tumbar la carga
+                # del modelo (el UnicodeEncodeError del "✓" se confundía con
+                # un fallo de Whisper y degradaba small→base→tiny→error).
+                pass
 
     pref = preferido or MODELO_WHISPER
     orden = [pref] + [m for m in MODELOS_WHISPER_FALLBACK if m != pref]
@@ -235,7 +242,8 @@ def obtener_duracion(video_path):
 # initial_prompt sesga a Whisper hacia el vocabulario esperado en la tirolina.
 # Reduce errores tipo "3, 2, 1" → "32 mil" o "qué tal" → "queta".
 _WHISPER_PROMPT = (
-    "Tres, dos, uno. ¡Buen vuelo! Disfruta del vuelo. Allá vamos. "
+    "Número catorce, número catorce. Tres, dos, uno. ¡Buen vuelo! "
+    "Disfruta del vuelo. Allá vamos. "
     "¿Qué tal? ¿Cómo estás? ¡Bienvenido! ¡Madre mía! Sobrevivimos."
 )
 
@@ -581,8 +589,8 @@ def _bloque_principal(bloques):
 
 
 # Muro de viento: parámetros calibrados sobre clips reales de Sunview.
-# - N_STD=3: el RMS del lanzamiento típicamente supera el baseline (charla en
-#   plataforma) en >5 desviaciones; 3 deja margen para clips con viento ambiente.
+# - N_STD=2.0: el RMS del lanzamiento típicamente supera el baseline (charla en
+#   plataforma) en >5 desviaciones; 2.0 deja margen para clips con viento ambiente.
 # - SOSTENIDO_S=3: las ráfagas puntuales o gritos del monitor duran <1 s; el
 #   viento del vuelo es sostenido. 3 s descarta picos espurios sin perder
 #   onsets reales.
@@ -645,8 +653,9 @@ def _detectar_onset_lanzamiento(
     NOTA SENSIBILIDAD: si en el futuro las GoPro tienen el "Wind Filter"
     activado, el pico de RMS baja (la cámara atenúa la banda <500 Hz que
     contiene la mayor parte del muro de viento). Síntomas: el detector
-    devuelve None con `pico` apenas por encima del umbral. Ajustes:
-      - bajar MURO_VIENTO_N_STD a 2.0 (menos exigente)
+    devuelve None con `pico` apenas por encima del umbral. Ajustes (los
+    valores por defecto actuales ya son N_STD=2.0, SOSTENIDO=3.0):
+      - bajar MURO_VIENTO_N_STD a 1.5 (menos exigente)
       - bajar MURO_VIENTO_SOSTENIDO_S a 2.0
       - en último recurso bajar MURO_VIENTO_UMBRAL_MIN a 0.005
     """
@@ -1195,6 +1204,107 @@ VENTANA_BUSQUEDA_LLEGADA_S = 20  # al recortar llegada tardía, buscar en los pr
 TOL_FIN_DENTRO_VIENTO_S = 10  # frase de llegada >10 s antes del fin del viento = exclamación mid-flight
 
 
+# ─── Detección del número de cliente (ORDEN) que dice el monitor ───
+# El monitor anuncia "número X" en el lanzamiento; queda en el audio. Buscamos
+# ese patrón en la transcripción para rellenar el Nº cliente automáticamente
+# (el humano luego lo confirma). Cubre cifras ("número 3") y palabras en
+# español ("tres", "trece", "veintitrés", "treinta y dos").
+
+_NUM_UNIDADES = {
+    "cero": 0, "un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4,
+    "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9,
+}
+_NUM_ESPECIALES = {
+    "diez": 10, "once": 11, "doce": 12, "trece": 13, "catorce": 14,
+    "quince": 15, "dieciseis": 16, "diecisiete": 17, "dieciocho": 18,
+    "diecinueve": 19, "veinte": 20, "veintiuno": 21, "veintidos": 22,
+    "veintitres": 23, "veinticuatro": 24, "veinticinco": 25, "veintiseis": 26,
+    "veintisiete": 27, "veintiocho": 28, "veintinueve": 29,
+}
+_NUM_DECENAS = {
+    "treinta": 30, "cuarenta": 40, "cincuenta": 50, "sesenta": 60,
+    "setenta": 70, "ochenta": 80, "noventa": 90,
+}
+
+
+def _quitar_acentos(texto):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", texto or "")
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def _palabras_a_numero(tokens):
+    """Convierte una lista de tokens en español a un entero, o None.
+
+    Maneja: '3', 'tres', 'trece', 'veintitres', 'treinta y dos'.
+    Solo mira el comienzo de la lista (la primera expresión numérica).
+    """
+    if not tokens:
+        return None
+    t0 = tokens[0]
+    if t0.isdigit():
+        return int(t0)
+    if t0 in _NUM_ESPECIALES:
+        return _NUM_ESPECIALES[t0]
+    if t0 in _NUM_DECENAS:
+        base = _NUM_DECENAS[t0]
+        # 'treinta y dos'
+        if len(tokens) >= 3 and tokens[1] == "y" and tokens[2] in _NUM_UNIDADES:
+            return base + _NUM_UNIDADES[tokens[2]]
+        return base
+    if t0 in _NUM_UNIDADES:
+        return _NUM_UNIDADES[t0]
+    return None
+
+
+def detectar_numero_cliente(transcripcion, t_centro=None, ventana=None):
+    """Busca 'número X' en la transcripción y devuelve el ORDEN detectado.
+
+    El ancla es la palabra 'numero', lo que evita confundirlo con la cuenta
+    atrás ('tres, dos, uno'). Devuelve dict {"numero", "texto", "start"} o None.
+
+    Selección del candidato (calibrada con transcripciones reales):
+      * El monitor anuncia el número al ENCENDER la cámara (primeros segundos
+        del clip), mucho antes del lanzamiento (`t_centro`, que puede llegar
+        60-140 s después). Por eso NO se filtra por distancia al lanzamiento
+        — la versión anterior usaba una ventana de ±20 s y descartaba el
+        anuncio en la mayoría de los clips.
+      * Si hay varios anuncios (clips multi-vuelo: "número uno" del cliente
+        anterior y "número dos" del que salta), el válido es el ÚLTIMO antes
+        del lanzamiento. Si todos son posteriores, el más cercano.
+
+    `ventana` se ignora (se mantiene por compatibilidad de firma).
+    """
+    import re
+
+    segs = transcripcion.get("segments", []) if transcripcion else []
+    candidatos = []  # (start, num, texto)
+    for s in segs:
+        texto_norm = _quitar_acentos(s["text"].lower())
+        # Buscar 'numero' y tomar las palabras siguientes
+        for m in re.finditer(r"\bnumero[s]?\b[:\s]*([\wáéíóú]+(?:\s+y\s+\w+)?)",
+                             texto_norm):
+            cola = m.group(1).replace(",", " ").split()
+            num = _palabras_a_numero(cola)
+            if num is not None:
+                candidatos.append((s["start"], num, s["text"].strip()))
+                break
+    if not candidatos:
+        return None
+
+    if t_centro is not None:
+        previos = [c for c in candidatos if c[0] <= t_centro]
+        if previos:
+            elegido = max(previos, key=lambda c: c[0])   # último antes del salto
+        else:
+            elegido = min(candidatos, key=lambda c: abs(c[0] - t_centro))
+    else:
+        elegido = candidatos[0]  # sin lanzamiento conocido: primer anuncio
+
+    start, num, texto = elegido
+    return {"numero": str(num), "texto": texto, "start": start}
+
+
 def _primera_frase_llegada(segments, desde, hasta):
     """Primera frase de PALABRAS_FIN dentro del intervalo [desde, hasta], o None."""
     for s in segments:
@@ -1402,7 +1512,7 @@ def main():
 
     videos = [
         f for f in CARPETA_ENTRADA.iterdir()
-        if f.is_file() and f.suffix in EXTENSIONES
+        if f.is_file() and f.suffix.lower() in EXTENSIONES
     ]
 
     if not videos:

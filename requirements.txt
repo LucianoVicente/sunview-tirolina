@@ -3,3 +3,9 @@ tkinterdnd2
 numpy
 Pillow>=10.0.0
 matplotlib>=3.7.0
+# Lectura del Google Sheets para el envío por correo (número -> email)
+gspread>=6.0.0
+google-auth>=2.0.0
+# Subida automática del vídeo (Gofile) con progreso
+requests>=2.28.0
+requests-toolbelt>=1.0.0

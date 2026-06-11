@@ -24,6 +24,14 @@ _check_fin.wav
 # Historial dinámico de duraciones de vuelo (se va aprendiendo de cada parque)
 historial_vuelos.json
 
+# Configuración y credenciales del envío por correo (NUNCA al repo)
+config_sheets.json
+*service_account*.json
+*credentials*.json
+*.json.key
+# Clave de la cuenta de servicio de Google (nombre que genera Google Cloud)
+sunviewparkvideos-*.json
+
 # Cache de Python
 __pycache__/
 *.pyc
@@ -32,6 +40,11 @@ __pycache__/
 
 # Claude Code (configuración local del asistente)
 .claude/
+
+# Notas y capturas locales de prueba (no van al repo)
+codigo_revision.txt
+fotos prueba/
+/*.png
 
 # Sistema operativo
 .DS_Store

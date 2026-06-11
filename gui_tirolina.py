@@ -18,6 +18,7 @@ import sys
 import tempfile
 import shutil
 import winsound
+import datetime
 from pathlib import Path
 
 # pythonw.exe no tiene consola — librerías como tqdm/whisper fallan al
@@ -25,12 +26,15 @@ from pathlib import Path
 # y los cerramos al salir para no fugar file descriptors.
 import atexit as _atexit
 _DEVNULL_HANDLES = []
+# encoding="utf-8" es imprescindible: con la codificación por defecto (cp1252)
+# cualquier print con "✓"/"⚠" lanza UnicodeEncodeError AUNQUE el destino sea
+# devnull — y tumbaba la carga del modelo Whisper bajo pythonw.
 if sys.stdout is None:
-    _h = open(os.devnull, "w")
+    _h = open(os.devnull, "w", encoding="utf-8")
     _DEVNULL_HANDLES.append(_h)
     sys.stdout = _h
 if sys.stderr is None:
-    _h = open(os.devnull, "w")
+    _h = open(os.devnull, "w", encoding="utf-8")
     _DEVNULL_HANDLES.append(_h)
     sys.stderr = _h
 
@@ -60,13 +64,15 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from editar_tirolina import (
     extraer_audio, obtener_duracion, transcribir_audio,
     editar_video, verificar_corte, validar_video,
-    sugerir_corte, cargar_modelo_whisper,
+    sugerir_corte, cargar_modelo_whisper, detectar_numero_cliente,
     extraer_3_frames, extraer_frames_grid, frame_mas_cercano,
     extraer_audio_snippet, extraer_clip_preview,
     envolvente_rms,
     segundos_a_mmss, CARPETA_SALIDA, EXTENSIONES,
     SEGUNDOS_ANTES_INICIO, SEGUNDOS_DESPUES_FIN,
 )
+import envio_correo
+import clientes
 
 COLORES = {
     "fondo":        "#F5F7FA",
@@ -130,7 +136,10 @@ class App(BaseVentana):
     def _precargar_modelo(self):
         self._modelo_error = None
         try:
-            self._modelo, _ = cargar_modelo_whisper()
+            # log → cola de la GUI: evita print (sin consola bajo pythonw) y
+            # muestra qué modelo se cargó si el análisis ya está en marcha.
+            self._modelo, _ = cargar_modelo_whisper(
+                log=lambda nivel, msg: self.cola.put(("log", (f"{msg}\n", nivel))))
         except Exception:
             import traceback
             self._modelo_error = traceback.format_exc()
@@ -212,11 +221,14 @@ class App(BaseVentana):
     def _on_drop(self, event):
         raw = self.tk.splitlist(event.data)
         videos = [Path(p) for p in raw
-                  if Path(p).is_file() and Path(p).suffix in EXTENSIONES]
+                  if Path(p).is_file() and Path(p).suffix.lower() in EXTENSIONES]
         if videos:
             self._set_videos(videos)
 
     def _set_videos(self, videos: list[Path]):
+        # dict.fromkeys deduplica conservando el orden: el mismo archivo
+        # arrastrado dos veces se analizaría y renderizaría duplicado.
+        videos = list(dict.fromkeys(videos))
         self.videos = videos
         if videos:
             self.lbl_seleccion.config(
@@ -325,8 +337,13 @@ class App(BaseVentana):
                 continue
 
             try:
+                # Clave única por clip. Dos vídeos con el MISMO nombre de
+                # archivo (típico entre tarjetas GoPro: GX010001.MP4 se repite)
+                # compartirían WAV, rejilla y previews y se contaminarían entre
+                # sí (oír/ver el clip equivocado al revisar). El índice lo evita.
+                clave = f"{i:03d}_{video.stem}"
                 # WAV temporal de este clip — vive hasta cerrar la app
-                audio_tmp = self.tmp_dir / f"{video.stem}.wav"
+                audio_tmp = self.tmp_dir / f"{clave}.wav"
                 self.cola.put(("log", ("  Extrayendo audio...\n", "info")))
                 extraer_audio(video, audio_tmp)
                 duracion = obtener_duracion(video)
@@ -351,21 +368,44 @@ class App(BaseVentana):
                 t1_sug = (min(duracion, sug["t_fin_raw"] + SEGUNDOS_DESPUES_FIN)
                           if sug["t_fin_raw"] is not None else duracion)
 
+                # Nº de cliente que dice el monitor ("número X") en el lanzamiento
+                det_num = detectar_numero_cliente(tx, t_centro=sug["t_inicio_raw"])
+                orden_sug = det_num["numero"] if det_num else ""
+                if det_num:
+                    self.cola.put(("log",
+                                   (f"  ✓ Nº cliente detectado: {orden_sug} "
+                                    f"(«{det_num['texto']}»)\n", "ok")))
+                else:
+                    self.cola.put(("log",
+                                   ("  ⚠ No se detectó el «número X» del monitor "
+                                    "(ponlo a mano)\n", "aviso")))
+
                 # Storyboard (rejilla 1 frame/s) + onda
                 self.cola.put(("log", ("  Generando rejilla de frames...\n", "info")))
-                grid_dir = Path(self.tmp_dir) / f"{Path(video).stem}_grid"
+                grid_dir = Path(self.tmp_dir) / f"{clave}_grid"
                 frames_grid = extraer_frames_grid(
                     video, grid_dir, ancho=ANCHO_FRAME, paso_s=1.0,
                 )
                 if not frames_grid:
-                    # Fallback: 3 frames sueltos alrededor del t0 sugerido
+                    # Fallback real: 3 frames sueltos alrededor del t0 sugerido,
+                    # mapeados a una mini-rejilla {segundo: ruta} para que el
+                    # storyboard los encuentre con frame_mas_cercano (antes el
+                    # mensaje lo prometía pero no se extraía ninguno).
                     self.cola.put(("log",
                                    ("  ⚠ Rejilla vacía, usando 3 frames sueltos\n",
-                                    "warn")))
+                                    "aviso")))
+                    sueltos = extraer_3_frames(
+                        video, t0_sug, grid_dir, ancho=ANCHO_FRAME, gap_s=5.0)
+                    for clave_f, off in (("antes", -5.0), ("inicio", 0.0),
+                                         ("despues", 5.0)):
+                        ruta = sueltos.get(clave_f)
+                        if ruta:
+                            frames_grid[int(round(max(0.0, t0_sug + off)))] = ruta
                 rms, _ = envolvente_rms(audio_tmp, n_puntos=800)
 
                 clips.append({
                     "video_path": video,
+                    "clave": clave,       # prefijo único para archivos temporales
                     "audio_tmp": audio_tmp,
                     "duracion": duracion,
                     "t_inicio_raw": sug["t_inicio_raw"],
@@ -376,6 +416,8 @@ class App(BaseVentana):
                     "t1": t1_sug,
                     "rms": rms,
                     "frames_grid": frames_grid,
+                    "orden": orden_sug,   # nº de cliente detectado (confirmable)
+                    "idioma": "es",       # idioma del correo (es/en)
                     "ok": False,
                     "rendered": False,
                     "error": None,
@@ -402,6 +444,7 @@ class App(BaseVentana):
             "t_inicio_raw": None, "t_fin_raw": None,
             "texto_inicio": "", "texto_fin": "",
             "t0": 0.0, "t1": 0.0, "rms": None, "frames_grid": {},
+            "orden": "", "idioma": "es",
             "ok": False, "rendered": False, "error": motivo,
             "render_error": None,
         }
@@ -682,6 +725,32 @@ class App(BaseVentana):
         )
         self.lbl_duracion.pack(anchor="w", pady=(6, 0))
 
+        # ── Datos de envío: Nº de cliente (ORDEN) + idioma del correo ──
+        # Se capturan aquí, al revisar (donde ya se oye el número en el audio).
+        # El envío en sí se hace en la Fase 3, cuando el vídeo final existe.
+        envio = tk.Frame(controles, bg=COLORES["panel"])
+        envio.pack(fill="x", pady=(8, 0))
+        tk.Label(envio, text="Nº cliente", font=(FUENTE, 10, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["texto"], width=10,
+                 anchor="w").pack(side="left")
+        self.var_orden = tk.StringVar(value=c.get("orden", ""))
+        self.var_orden.trace_add(
+            "write",
+            lambda *_: self._guardar_orden())
+        tk.Entry(envio, textvariable=self.var_orden, width=6,
+                 font=(FUENTE, 11), justify="center").pack(side="left", padx=4)
+        tk.Label(envio, text="  Idioma:", font=(FUENTE, 10),
+                 bg=COLORES["panel"], fg=COLORES["texto"]).pack(side="left",
+                                                                padx=(12, 2))
+        self.var_idioma = tk.StringVar(value=c.get("idioma", "es"))
+        for cod, etiq in (("es", "Español"), ("en", "English")):
+            tk.Radiobutton(
+                envio, text=etiq, value=cod, variable=self.var_idioma,
+                font=(FUENTE, 10), bg=COLORES["panel"], fg=COLORES["texto"],
+                selectcolor=COLORES["panel"], activebackground=COLORES["panel"],
+                command=self._guardar_idioma,
+            ).pack(side="left", padx=2)
+
         # Acciones
         acciones = tk.Frame(cont, bg=COLORES["panel"])
         acciones.pack(fill="x", pady=(10, 0))
@@ -826,11 +895,38 @@ class App(BaseVentana):
         if t1 - t0 < 0.5:
             messagebox.showwarning("Tiempos", "El fin debe ser posterior al inicio")
             return
-        c["t0"] = max(0.0, min(c["duracion"], t0))
+        c["t0"] = max(0.0, min(c["duracion"] - 0.5, t0))
         c["t1"] = max(c["t0"] + 0.5, min(c["duracion"], t1))
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
         self._refrescar_storyboard(c, c["t0"])
+
+    def _sync_entries_silencioso(self):
+        """Vuelca los Entry de Inicio/Fin del clip mostrado al modelo, sin
+        popups de error. Para edición de última hora antes de renderizar; si el
+        formato es inválido se ignora (el clip conserva sus tiempos previos)."""
+        c = self._clip_actual()
+        if c is None or not hasattr(self, "var_t0"):
+            return
+        try:
+            t0 = _mmss_a_segundos(self.var_t0.get())
+            t1 = _mmss_a_segundos(self.var_t1.get())
+        except ValueError:
+            return
+        if t1 - t0 < 0.5:
+            return
+        c["t0"] = max(0.0, min(c["duracion"] - 0.5, t0))
+        c["t1"] = max(c["t0"] + 0.5, min(c["duracion"], t1))
+
+    def _guardar_orden(self):
+        c = self._clip_actual()
+        if c is not None and hasattr(self, "var_orden"):
+            c["orden"] = self.var_orden.get().strip()
+
+    def _guardar_idioma(self):
+        c = self._clip_actual()
+        if c is not None and hasattr(self, "var_idioma"):
+            c["idioma"] = self.var_idioma.get()
 
     def _refrescar_storyboard(self, c: dict, t_centro: float):
         """Actualiza las 3 miniaturas (t-2, t, t+2) desde la rejilla pre-extraída.
@@ -880,7 +976,15 @@ class App(BaseVentana):
         if c is None or c.get("audio_tmp") is None:
             return
         t0_pre = max(0.0, c["t0"] - PREVIEW_DUR_S / 2)
-        snippet = self.tmp_dir / f"_preview_{c['video_path'].stem}.wav"
+        clave = c.get("clave") or c["video_path"].stem
+        snippet = self.tmp_dir / f"_preview_{clave}.wav"
+        # Detener la reproducción anterior: winsound mantiene el WAV abierto
+        # mientras suena y ffmpeg no puede sobrescribirlo — pulsar Espacio
+        # otra vez antes de que acabe se quedaba mudo.
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except RuntimeError:
+            pass
         if extraer_audio_snippet(c["audio_tmp"], t0_pre, PREVIEW_DUR_S, snippet):
             try:
                 winsound.PlaySound(
@@ -896,7 +1000,8 @@ class App(BaseVentana):
         if c is None:
             return
         t0_pre = max(0.0, c["t0"] - PREVIEW_DUR_S / 2)
-        clip_out = self.tmp_dir / f"_preview_{c['video_path'].stem}.mp4"
+        clave = c.get("clave") or c["video_path"].stem
+        clip_out = self.tmp_dir / f"_preview_{clave}.mp4"
         ok = extraer_clip_preview(c["video_path"], t0_pre, PREVIEW_DUR_S, clip_out)
         if ok:
             try:
@@ -935,6 +1040,10 @@ class App(BaseVentana):
     # FASE 3 — Render: genera vídeos aprobados
     # ─────────────────────────────────────────────────────────────────────
     def _iniciar_render(self):
+        # Aplica cualquier edición pendiente en los Entry del clip mostrado:
+        # si el usuario ajusta Inicio/Fin y pulsa "Generar" sin confirmar con
+        # Enter, sin esto se renderizaría con los tiempos antiguos.
+        self._sync_entries_silencioso()
         aprobados = [c for c in self.clips
                      if c.get("ok") and not c.get("error")]
         if not aprobados:
@@ -973,13 +1082,35 @@ class App(BaseVentana):
             self.log.tag_config(nivel, foreground=color)
         self.log.config(state="disabled")
 
+    @staticmethod
+    def _salida_unica(stem, usados):
+        """Ruta _FINAL.mp4 sin colisión DENTRO del lote.
+
+        Dos clips con el mismo nombre de archivo (tarjetas GoPro distintas)
+        generarían el mismo _FINAL.mp4 y el segundo sobrescribiría al primero
+        —un cliente se quedaría sin vídeo—. Si el nombre ya se usó en este
+        render, se añade un sufijo _2, _3… Reprocesar el mismo vídeo en otra
+        sesión sí reemplaza su salida (comportamiento esperado).
+        """
+        base = CARPETA_SALIDA / f"{stem}_FINAL.mp4"
+        if base not in usados:
+            return base
+        n = 2
+        while True:
+            cand = CARPETA_SALIDA / f"{stem}_FINAL_{n}.mp4"
+            if cand not in usados:
+                return cand
+            n += 1
+
     def _worker_render(self, aprobados):
+        usados: set = set()
         for i, c in enumerate(aprobados, 1):
             self.cola.put(("prog_label",
                            f"[{i}/{len(aprobados)}] {c['video_path'].name}"))
             self.cola.put(("log",
                            (f"\n── {c['video_path'].name} ──\n", "header")))
-            salida = CARPETA_SALIDA / f"{c['video_path'].stem}_FINAL.mp4"
+            salida = self._salida_unica(c["video_path"].stem, usados)
+            usados.add(salida)
             try:
                 editar_video(c["video_path"], c["t0"], c["t1"], salida)
                 self.cola.put(("log",
@@ -1009,6 +1140,10 @@ class App(BaseVentana):
             for c in err:
                 self._append_log(f"  · {c['video_path'].name}: {c['render_error']}\n",
                                   "error")
+        renderizados = [c for c in aprobados if c.get("rendered")]
+        if renderizados:
+            self._construir_panel_entrega(renderizados)
+
         # Botón final para volver al inicio + abrir carpeta
         pie = tk.Frame(self, bg=COLORES["fondo"])
         pie.pack(fill="x", pady=10)
@@ -1020,6 +1155,223 @@ class App(BaseVentana):
                   font=(FUENTE, 10), bg=COLORES["fondo"], fg=COLORES["acento"],
                   relief="flat", cursor="hand2", padx=14, pady=6,
                   command=self._reset).pack(side="right", padx=16)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # FASE 3b — Entrega: por cada vídeo, subir a WeTransfer + abrir Gmail
+    # ─────────────────────────────────────────────────────────────────────
+    def _construir_panel_entrega(self, clips):
+        """Lista scrollable: una fila por vídeo con Nº cliente + botones de envío."""
+        marco = tk.LabelFrame(
+            self, text=" Entrega por correo ",
+            font=(FUENTE, 11, "bold"), bg=COLORES["fondo"], fg=COLORES["texto"],
+            padx=8, pady=8,
+        )
+        marco.pack(fill="both", expand=True, padx=16, pady=(4, 0))
+
+        metodo = envio_correo.metodo_entrega()
+        if metodo == "manual":
+            aviso = ("«Subir vídeo» abre WeTransfer y tú arrastras el archivo; "
+                     "copia el link y pulsa «Abrir correo».")
+        else:
+            destino = "Google Drive" if metodo == "drive" else "Gofile"
+            aviso = (f"«Subir vídeo» sube a {destino} automáticamente y copia "
+                     "el enlace; «Abrir correo» abre tu correo con todo puesto.")
+        if not clientes.configurado():
+            aviso += " (Sheets sin configurar: el email habrá que ponerlo a mano.)"
+        tk.Label(marco, text=aviso, font=(FUENTE, 9),
+                 bg=COLORES["fondo"], fg=COLORES["texto_suave"],
+                 anchor="w").pack(fill="x", pady=(0, 6))
+
+        # Fecha de los vídeos (para localizar el bloque/pestaña en el Sheets).
+        # Por defecto HOY; solo se cambia si se procesan vídeos de otro día.
+        fila_fecha = tk.Frame(marco, bg=COLORES["fondo"])
+        fila_fecha.pack(fill="x", pady=(0, 6))
+        tk.Label(fila_fecha, text="Fecha de los vídeos:", font=(FUENTE, 9),
+                 bg=COLORES["fondo"], fg=COLORES["texto"]).pack(side="left")
+        self.var_fecha_entrega = tk.StringVar(
+            value=datetime.date.today().strftime("%d/%m/%Y"))
+        tk.Entry(fila_fecha, textvariable=self.var_fecha_entrega, width=12,
+                 font=(FUENTE, 10), justify="center").pack(side="left", padx=6)
+        tk.Label(fila_fecha, text="(dd/mm/aaaa — normalmente hoy)",
+                 font=(FUENTE, 8), bg=COLORES["fondo"],
+                 fg=COLORES["texto_suave"]).pack(side="left")
+
+        # Canvas + scrollbar para soportar muchos vídeos
+        cont = tk.Frame(marco, bg=COLORES["fondo"])
+        cont.pack(fill="both", expand=True)
+        canvas = tk.Canvas(cont, bg=COLORES["fondo"], highlightthickness=0, height=220)
+        sb = tk.Scrollbar(cont, orient="vertical", command=canvas.yview)
+        interior = tk.Frame(canvas, bg=COLORES["fondo"])
+        interior.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=interior, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self._entrega_vars = {}  # id(clip) -> StringVar del Nº cliente
+        for c in clips:
+            self._fila_entrega(interior, c)
+
+    def _fila_entrega(self, parent, c):
+        fila = tk.Frame(parent, bg=COLORES["panel"], padx=8, pady=6)
+        fila.pack(fill="x", pady=2)
+
+        tk.Label(fila, text=c["salida"].name, font=(FUENTE, 10),
+                 bg=COLORES["panel"], fg=COLORES["texto"], width=28,
+                 anchor="w").pack(side="left")
+
+        tk.Label(fila, text="Nº", font=(FUENTE, 10, "bold"),
+                 bg=COLORES["panel"], fg=COLORES["texto"]).pack(side="left",
+                                                                padx=(8, 2))
+        var = tk.StringVar(value=c.get("orden", ""))
+        var.trace_add("write", lambda *_a, cc=c, v=var: cc.update(orden=v.get().strip()))
+        self._entrega_vars[id(c)] = var
+        tk.Entry(fila, textvariable=var, width=5, font=(FUENTE, 11),
+                 justify="center").pack(side="left", padx=2)
+
+        idi = tk.Label(fila, text=("EN" if c.get("idioma") == "en" else "ES"),
+                       font=(FUENTE, 9), bg=COLORES["panel"],
+                       fg=COLORES["texto_suave"])
+        idi.pack(side="left", padx=6)
+
+        estado = tk.Label(fila, text="", font=(FUENTE, 9),
+                          bg=COLORES["panel"], fg=COLORES["texto_suave"])
+        estado.pack(side="right", padx=(6, 0))
+
+        tk.Button(fila, text="✉️ Abrir correo", font=(FUENTE, 10),
+                  bg=COLORES["acento"], fg="white", relief="flat",
+                  cursor="hand2", padx=10,
+                  command=lambda cc=c, st=estado: self._abrir_correo_cliente(cc, st),
+                  ).pack(side="right", padx=4)
+        tk.Button(fila, text="📤 Subir vídeo", font=(FUENTE, 10),
+                  bg=COLORES["fondo"], fg=COLORES["texto"], relief="flat",
+                  cursor="hand2", padx=10,
+                  command=lambda cc=c, st=estado: self._subir_video(cc, st),
+                  ).pack(side="right", padx=4)
+
+    def _subir_video(self, c, estado_lbl):
+        """Sube el vídeo en segundo plano y guarda el enlace de descarga.
+
+        Método según config: gofile (defecto, sin configuración), drive
+        (cuenta de servicio) o manual (abre WeTransfer + explorador).
+        """
+        metodo = envio_correo.metodo_entrega()
+        if metodo == "drive" and not envio_correo.drive_configurado():
+            metodo = "manual"
+        if metodo == "manual":
+            envio_correo.abrir_wetransfer()
+            envio_correo.abrir_carpeta_seleccionando(c["salida"])
+            estado_lbl.config(
+                text="WeTransfer abierto → arrastra el vídeo y copia el link",
+                fg=COLORES["acento"])
+            return
+        if c.get("_subiendo"):
+            return
+        c["_subiendo"] = True
+        estado_lbl.config(text="Subiendo… 0%", fg=COLORES["acento"])
+        subir = (envio_correo.subir_video_drive if metodo == "drive"
+                 else envio_correo.subir_video_gofile)
+        threading.Thread(target=self._worker_subir,
+                         args=(c, estado_lbl, subir, metodo),
+                         daemon=True).start()
+
+    def _worker_subir(self, c, estado_lbl, subir, metodo):
+        """Hilo de subida: progreso y resultado via cola (tk solo en main thread)."""
+        def _progreso(pct):
+            self.cola.put(("entrega_estado",
+                           (estado_lbl, f"Subiendo… {pct}%", COLORES["acento"])))
+        try:
+            link = subir(c["salida"], progreso=_progreso)
+            c["link"] = link
+            self.cola.put(("entrega_link", (c, estado_lbl, link)))
+            if metodo == "drive":
+                # Mantenimiento: borrar del Drive los vídeos antiguos
+                envio_correo.limpiar_drive_antiguos()
+        except envio_correo.EnvioError as exc:
+            self.cola.put(("entrega_estado",
+                           (estado_lbl, f"⚠ {exc}", COLORES["error"])))
+        except Exception as exc:  # red caída, timeout…
+            self.cola.put(("entrega_estado",
+                           (estado_lbl, f"⚠ Error de red subiendo: {exc}",
+                            COLORES["error"])))
+        finally:
+            c["_subiendo"] = False
+
+    def _on_entrega_estado(self, estado_lbl, texto, color):
+        try:
+            estado_lbl.config(text=texto, fg=color)
+        except tk.TclError:
+            pass  # el panel se cerró mientras subía
+
+    def _on_entrega_link(self, c, estado_lbl, link):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(link)
+        except tk.TclError:
+            pass
+        self._on_entrega_estado(
+            estado_lbl,
+            "✓ Subido — link copiado, pulsa «Abrir correo»",
+            COLORES["ok"])
+
+    def _fecha_entrega(self):
+        """Lee la fecha del panel de entrega (dd/mm/aaaa); si falla, hoy."""
+        txt = ""
+        if hasattr(self, "var_fecha_entrega"):
+            txt = self.var_fecha_entrega.get().strip()
+        try:
+            d, m, a = txt.split("/")
+            return datetime.date(int(a), int(m), int(d))
+        except (ValueError, AttributeError):
+            return datetime.date.today()
+
+    def _abrir_correo_cliente(self, c, estado_lbl):
+        """Busca el email por Nº cliente, coge el link del portapapeles y abre Gmail."""
+        orden = (c.get("orden") or "").strip()
+        fecha = self._fecha_entrega()
+        # 1) Email del cliente (desde el Sheets, si está configurado)
+        email = ""
+        if orden and clientes.configurado():
+            try:
+                info = clientes.buscar_cliente(orden, fecha)
+                email = info.get("email", "")
+                if not email:
+                    estado_lbl.config(
+                        text=f"⚠ ORDEN {orden} encontrado pero sin email en la hoja",
+                        fg=COLORES["aviso"])
+            except clientes.ClientesError as exc:
+                estado_lbl.config(text=f"⚠ {exc}", fg=COLORES["error"])
+        elif orden and not clientes.configurado():
+            estado_lbl.config(
+                text="Sheets no configurado: escribe el email a mano en Gmail",
+                fg=COLORES["aviso"])
+        elif not orden:
+            estado_lbl.config(text="Escribe primero el Nº de cliente",
+                              fg=COLORES["aviso"])
+
+        # 2) Link de descarga: el de la subida automática a Drive si existe;
+        #    si no, el del portapapeles (flujo manual WeTransfer).
+        link = c.get("link")
+        if not link:
+            try:
+                posible = self.clipboard_get()
+                if envio_correo.parece_enlace_wetransfer(posible):
+                    link = posible.strip()
+            except tk.TclError:
+                pass  # portapapeles vacío o no-texto
+
+        # 3) Abrir el webmail (Gmail u Outlook según remitente) ya redactado
+        asunto, cuerpo = envio_correo.redactar_correo(
+            c.get("idioma", "es"), "", link)
+        envio_correo.abrir_correo_redactado(email, asunto, cuerpo)
+        if link:
+            estado_lbl.config(text="Correo abierto con el link puesto → revisa y envía",
+                              fg=COLORES["ok"])
+        elif estado_lbl.cget("text") in ("", None):
+            estado_lbl.config(text="Correo abierto (pega el link y envía)",
+                              fg=COLORES["acento"])
 
     def _abrir_carpeta(self):
         try:
@@ -1038,31 +1390,27 @@ class App(BaseVentana):
     # Atajos de teclado globales
     # ─────────────────────────────────────────────────────────────────────
     def _bind_atajos(self):
-        self.bind("<Up>", lambda e: self._navegar(-1) if self.fase == "revision" else None)
-        self.bind("<Down>", lambda e: self._navegar(+1) if self.fase == "revision" else None)
-        self.bind("<Left>", self._on_izq)
-        self.bind("<Right>", self._on_der)
-        self.bind("<Return>", lambda e: self._aprobar_y_siguiente() if self.fase == "revision" else None)
-        self.bind("<space>", lambda e: self._reproducir_audio() if self.fase == "revision" else None)
-        self.bind("v", lambda e: self._abrir_video_externo() if self.fase == "revision" else None)
-        self.bind("V", lambda e: self._abrir_video_externo() if self.fase == "revision" else None)
+        self.bind("<Up>", self._atajo(lambda: self._navegar(-1)))
+        self.bind("<Down>", self._atajo(lambda: self._navegar(+1)))
+        self.bind("<Left>", self._atajo(lambda: self._ajustar_t0(-1)))
+        self.bind("<Right>", self._atajo(lambda: self._ajustar_t0(+1)))
+        self.bind("<Return>", self._atajo(self._aprobar_y_siguiente))
+        self.bind("<space>", self._atajo(self._reproducir_audio))
+        self.bind("v", self._atajo(self._abrir_video_externo))
+        self.bind("V", self._atajo(self._abrir_video_externo))
 
-    def _on_izq(self, e):
-        if self.fase != "revision":
-            return
-        # Si el foco está en el Entry, dejar al Entry mover el cursor
-        w = self.focus_get()
-        if isinstance(w, tk.Entry):
-            return
-        self._ajustar_t0(-1)
-
-    def _on_der(self, e):
-        if self.fase != "revision":
-            return
-        w = self.focus_get()
-        if isinstance(w, tk.Entry):
-            return
-        self._ajustar_t0(+1)
+    def _atajo(self, accion):
+        """Envuelve un atajo global: solo actúa en fase de revisión y NUNCA
+        mientras se escribe en un Entry. Sin esta guarda, Enter en el campo
+        Inicio aplicaba el tiempo Y aprobaba el clip saltando al siguiente;
+        teclear 'v' en Nº cliente abría el reproductor; espacio lanzaba audio."""
+        def handler(_e):
+            if self.fase != "revision":
+                return
+            if isinstance(self.focus_get(), tk.Entry):
+                return
+            accion()
+        return handler
 
     # ─────────────────────────────────────────────────────────────────────
     # Polling de cola para comunicación con workers
@@ -1083,6 +1431,10 @@ class App(BaseVentana):
                     self._entrar_revision(data)
                 elif tipo == "fin_render":
                     self._on_fin_render(data)
+                elif tipo == "entrega_estado":
+                    self._on_entrega_estado(*data)
+                elif tipo == "entrega_link":
+                    self._on_entrega_link(*data)
                 elif tipo == "modelo_error":
                     pass  # se logueará al iniciar análisis
         except queue.Empty:
@@ -1105,6 +1457,11 @@ class App(BaseVentana):
             w.destroy()
 
     def _on_cerrar(self):
+        # Soltar el WAV en reproducción para que el rmtree del tmp no falle.
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except RuntimeError:
+            pass
         try:
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
         except OSError:
