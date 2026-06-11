@@ -1083,8 +1083,20 @@ class App(BaseVentana):
         self.log.config(state="disabled")
 
     @staticmethod
-    def _salida_unica(stem, usados):
-        """Ruta _FINAL.mp4 sin colisión DENTRO del lote.
+    def _carpeta_salida_hoy():
+        """Subcarpeta de salida por día (ej. salida/11-06-2026).
+
+        Los nombres comerciales "1.1 SUNVIEW PARK" se repiten entre días
+        porque el ORDEN se reinicia cada mañana; separar por fecha evita que
+        el vídeo de hoy pise el de ayer.
+        """
+        carpeta = CARPETA_SALIDA / datetime.date.today().strftime("%d-%m-%Y")
+        carpeta.mkdir(parents=True, exist_ok=True)
+        return carpeta
+
+    @staticmethod
+    def _salida_unica(carpeta, stem, usados):
+        """Ruta _FINAL.mp4 sin colisión DENTRO del lote (respaldo sin nº).
 
         Dos clips con el mismo nombre de archivo (tarjetas GoPro distintas)
         generarían el mismo _FINAL.mp4 y el segundo sobrescribiría al primero
@@ -1092,24 +1104,47 @@ class App(BaseVentana):
         render, se añade un sufijo _2, _3… Reprocesar el mismo vídeo en otra
         sesión sí reemplaza su salida (comportamiento esperado).
         """
-        base = CARPETA_SALIDA / f"{stem}_FINAL.mp4"
+        base = carpeta / f"{stem}_FINAL.mp4"
         if base not in usados:
             return base
         n = 2
         while True:
-            cand = CARPETA_SALIDA / f"{stem}_FINAL_{n}.mp4"
+            cand = carpeta / f"{stem}_FINAL_{n}.mp4"
             if cand not in usados:
                 return cand
             n += 1
 
+    def _salida_para(self, c, carpeta, contadores, usados):
+        """Nombre comercial "N.K SUNVIEW PARK.mp4".
+
+        N = nº de cliente (ORDEN) y K = posición entre los vídeos de ese
+        cliente hoy (1.1, 1.2, 2.1, ...), el mismo formato que el personal
+        usaba al renombrar a mano. Si en la carpeta de hoy ya existe un N.K
+        de un lote anterior, este vídeo pasa a ser el siguiente de ese
+        cliente — nunca se pisa un vídeo final. Sin nº de cliente se cae al
+        esquema antiguo por nombre de archivo original.
+        """
+        orden = (c.get("orden") or "").strip()
+        if not orden:
+            return self._salida_unica(carpeta, c["video_path"].stem, usados)
+        k = contadores.get(orden, 0) + 1
+        while True:
+            cand = carpeta / f"{orden}.{k} SUNVIEW PARK.mp4"
+            if cand not in usados and not cand.exists():
+                contadores[orden] = k
+                return cand
+            k += 1
+
     def _worker_render(self, aprobados):
         usados: set = set()
+        contadores: dict = {}
+        carpeta = self._carpeta_salida_hoy()
         for i, c in enumerate(aprobados, 1):
             self.cola.put(("prog_label",
                            f"[{i}/{len(aprobados)}] {c['video_path'].name}"))
             self.cola.put(("log",
                            (f"\n── {c['video_path'].name} ──\n", "header")))
-            salida = self._salida_unica(c["video_path"].stem, usados)
+            salida = self._salida_para(c, carpeta, contadores, usados)
             usados.add(salida)
             try:
                 editar_video(c["video_path"], c["t0"], c["t1"], salida)
@@ -1374,8 +1409,9 @@ class App(BaseVentana):
                               fg=COLORES["acento"])
 
     def _abrir_carpeta(self):
+        hoy = CARPETA_SALIDA / datetime.date.today().strftime("%d-%m-%Y")
         try:
-            os.startfile(str(CARPETA_SALIDA))
+            os.startfile(str(hoy if hoy.exists() else CARPETA_SALIDA))
         except OSError:
             pass
 
