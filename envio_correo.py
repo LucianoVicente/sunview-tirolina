@@ -313,6 +313,8 @@ def limpiar_drive_antiguos(dias=None):
 PLACEHOLDER_LINK = "👉 (pega aquí el enlace de WeTransfer)"
 
 # Plantillas por idioma. {nombre} y {link} los rellena la app.
+# "cuerpo_varios" se usa cuando el cliente tiene más de un vídeo: un solo
+# correo con todos sus enlaces, uno por línea.
 PLANTILLAS = {
     "es": {
         "asunto": "Tu vídeo de tirolina en Sunview Park",
@@ -322,6 +324,15 @@ PLANTILLAS = {
             "Puedes descargarlo desde este enlace:\n\n"
             "{link}\n\n"
             "El enlace está disponible solo unos días, así que guárdalo cuanto antes.\n\n"
+            "¡Gracias por volar con nosotros!\n"
+            "Equipo Sunview Park"
+        ),
+        "cuerpo_varios": (
+            "¡Hola {nombre}!\n\n"
+            "Aquí tienes los vídeos de tus saltos en la tirolina de Sunview Park.\n"
+            "Puedes descargarlos desde estos enlaces:\n\n"
+            "{link}\n\n"
+            "Los enlaces están disponibles solo unos días, así que guárdalos cuanto antes.\n\n"
             "¡Gracias por volar con nosotros!\n"
             "Equipo Sunview Park"
         ),
@@ -337,6 +348,15 @@ PLANTILLAS = {
             "Thanks for flying with us!\n"
             "The Sunview Park Team"
         ),
+        "cuerpo_varios": (
+            "Hi {nombre}!\n\n"
+            "Here are the videos of your zipline jumps at Sunview Park.\n"
+            "You can download them from these links:\n\n"
+            "{link}\n\n"
+            "The links are only available for a few days, so please save them soon.\n\n"
+            "Thanks for flying with us!\n"
+            "The Sunview Park Team"
+        ),
     },
 }
 
@@ -346,14 +366,21 @@ IDIOMAS_DISPONIBLES = ("es", "en")
 def redactar_correo(idioma, nombre, link=None):
     """Devuelve (asunto, cuerpo) con la plantilla del idioma ya rellenada.
 
-    Si `link` es None se usa un marcador para que el humano lo pegue. Si
-    `nombre` está vacío se usa un saludo genérico para no dejar "¡Hola !".
+    `link` puede ser un enlace, una LISTA de enlaces (cliente con varios
+    vídeos: un solo correo con un enlace por línea) o None — en ese caso se
+    usa un marcador para que el humano lo pegue. Si `nombre` está vacío se
+    usa un saludo genérico para no dejar "¡Hola !".
     """
     plantilla = PLANTILLAS.get(idioma, PLANTILLAS["es"])
     nombre = (nombre or "").strip() or ("there" if idioma == "en" else "")
-    link_txt = link.strip() if link else PLACEHOLDER_LINK
+    if isinstance(link, (list, tuple)):
+        links = [l.strip() for l in link if l and l.strip()]
+    else:
+        links = [link.strip()] if link and link.strip() else []
+    link_txt = "\n".join(links) if links else PLACEHOLDER_LINK
     asunto = plantilla["asunto"]
-    cuerpo = plantilla["cuerpo"].format(nombre=nombre, link=link_txt)
+    clave_cuerpo = "cuerpo_varios" if len(links) > 1 else "cuerpo"
+    cuerpo = plantilla[clave_cuerpo].format(nombre=nombre, link=link_txt)
     # Si no había nombre en español, limpia el doble espacio del saludo.
     cuerpo = cuerpo.replace("¡Hola !", "¡Hola!").replace("Hi !", "Hi there!")
     return asunto, cuerpo

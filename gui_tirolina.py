@@ -14,6 +14,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
 import os
+import re
 import sys
 import tempfile
 import shutil
@@ -368,14 +369,25 @@ class App(BaseVentana):
                 t1_sug = (min(duracion, sug["t_fin_raw"] + SEGUNDOS_DESPUES_FIN)
                           if sug["t_fin_raw"] is not None else duracion)
 
-                # Nº de cliente que dice el monitor ("número X") en el lanzamiento
+                # Nº de cliente: primero del nombre del archivo — los
+                # monitores ya renombran cada descarga "N.K" (cliente N,
+                # vídeo K), p. ej. "2.1.mp4" → cliente 2 —; si el archivo no
+                # sigue ese patrón, del audio ("número X" del monitor).
+                m_nombre = re.match(r"\s*(\d+)\.(\d+)", video.stem)
                 det_num = detectar_numero_cliente(tx, t_centro=sug["t_inicio_raw"])
-                orden_sug = det_num["numero"] if det_num else ""
-                if det_num:
+                if m_nombre:
+                    orden_sug = m_nombre.group(1)
+                    self.cola.put(("log",
+                                   (f"  ✓ Nº cliente {orden_sug} "
+                                    f"(del nombre del archivo {video.name})\n",
+                                    "ok")))
+                elif det_num:
+                    orden_sug = det_num["numero"]
                     self.cola.put(("log",
                                    (f"  ✓ Nº cliente detectado: {orden_sug} "
                                     f"(«{det_num['texto']}»)\n", "ok")))
                 else:
+                    orden_sug = ""
                     self.cola.put(("log",
                                    ("  ⚠ No se detectó el «número X» del monitor "
                                     "(ponlo a mano)\n", "aviso")))
@@ -1095,56 +1107,36 @@ class App(BaseVentana):
         return carpeta
 
     @staticmethod
-    def _salida_unica(carpeta, stem, usados):
-        """Ruta _FINAL.mp4 sin colisión DENTRO del lote (respaldo sin nº).
+    def _salida_para(c, carpeta, usados):
+        """Nombre comercial: nombre original + " SUNVIEW PARK".
 
-        Dos clips con el mismo nombre de archivo (tarjetas GoPro distintas)
-        generarían el mismo _FINAL.mp4 y el segundo sobrescribiría al primero
-        —un cliente se quedaría sin vídeo—. Si el nombre ya se usó en este
-        render, se añade un sufijo _2, _3… Reprocesar el mismo vídeo en otra
-        sesión sí reemplaza su salida (comportamiento esperado).
+        Los monitores ya nombran cada descarga "N.K" (cliente N, vídeo K);
+        a la app solo le toca añadir la marca: "2.1.mp4" → "2.1 SUNVIEW
+        PARK.mp4". Si el nombre se repite dentro del lote (mismo archivo en
+        dos tarjetas), se añade (2), (3)… para no pisar al primero.
+        Reprocesar un vídeo en otra sesión sí reemplaza su salida
+        (comportamiento esperado).
         """
-        base = carpeta / f"{stem}_FINAL.mp4"
+        stem = c["video_path"].stem.strip()
+        base = carpeta / f"{stem} SUNVIEW PARK.mp4"
         if base not in usados:
             return base
         n = 2
         while True:
-            cand = carpeta / f"{stem}_FINAL_{n}.mp4"
+            cand = carpeta / f"{stem} SUNVIEW PARK ({n}).mp4"
             if cand not in usados:
                 return cand
             n += 1
 
-    def _salida_para(self, c, carpeta, contadores, usados):
-        """Nombre comercial "N.K SUNVIEW PARK.mp4".
-
-        N = nº de cliente (ORDEN) y K = posición entre los vídeos de ese
-        cliente hoy (1.1, 1.2, 2.1, ...), el mismo formato que el personal
-        usaba al renombrar a mano. Si en la carpeta de hoy ya existe un N.K
-        de un lote anterior, este vídeo pasa a ser el siguiente de ese
-        cliente — nunca se pisa un vídeo final. Sin nº de cliente se cae al
-        esquema antiguo por nombre de archivo original.
-        """
-        orden = (c.get("orden") or "").strip()
-        if not orden:
-            return self._salida_unica(carpeta, c["video_path"].stem, usados)
-        k = contadores.get(orden, 0) + 1
-        while True:
-            cand = carpeta / f"{orden}.{k} SUNVIEW PARK.mp4"
-            if cand not in usados and not cand.exists():
-                contadores[orden] = k
-                return cand
-            k += 1
-
     def _worker_render(self, aprobados):
         usados: set = set()
-        contadores: dict = {}
         carpeta = self._carpeta_salida_hoy()
         for i, c in enumerate(aprobados, 1):
             self.cola.put(("prog_label",
                            f"[{i}/{len(aprobados)}] {c['video_path'].name}"))
             self.cola.put(("log",
                            (f"\n── {c['video_path'].name} ──\n", "header")))
-            salida = self._salida_para(c, carpeta, contadores, usados)
+            salida = self._salida_para(c, carpeta, usados)
             usados.add(salida)
             try:
                 editar_video(c["video_path"], c["t0"], c["t1"], salida)
@@ -1217,8 +1209,9 @@ class App(BaseVentana):
                      "copia el link y pulsa «Abrir correo».")
         else:
             destino = "Google Drive" if metodo == "drive" else "Gofile"
-            aviso = (f"«Subir vídeo» sube a {destino} automáticamente y copia "
-                     "el enlace; «Abrir correo» abre tu correo con todo puesto.")
+            aviso = (f"«Subir vídeo» sube a {destino} automáticamente; "
+                     "«Abrir correo» junta TODOS los enlaces del mismo Nº de "
+                     "cliente en un solo correo (sube primero todos los suyos).")
         if not clientes.configurado():
             aviso += " (Sheets sin configurar: el email habrá que ponerlo a mano.)"
         tk.Label(marco, text=aviso, font=(FUENTE, 9),
@@ -1254,6 +1247,7 @@ class App(BaseVentana):
         sb.pack(side="right", fill="y")
 
         self._entrega_vars = {}  # id(clip) -> StringVar del Nº cliente
+        self._clips_entrega = clips  # para agrupar links por Nº de cliente
         for c in clips:
             self._fila_entrega(interior, c)
 
@@ -1371,7 +1365,12 @@ class App(BaseVentana):
             return datetime.date.today()
 
     def _abrir_correo_cliente(self, c, estado_lbl):
-        """Busca el email por Nº cliente, coge el link del portapapeles y abre Gmail."""
+        """Busca el email por Nº cliente y abre Gmail con sus enlaces.
+
+        Cada vídeo se sube por separado (un enlace por vídeo), pero un
+        cliente con varios vídeos recibe UN solo correo con todos sus
+        enlaces, uno por línea.
+        """
         orden = (c.get("orden") or "").strip()
         fecha = self._fecha_entrega()
         # 1) Email del cliente (desde el Sheets, si está configurado)
@@ -1394,22 +1393,44 @@ class App(BaseVentana):
             estado_lbl.config(text="Escribe primero el Nº de cliente",
                               fg=COLORES["aviso"])
 
-        # 2) Link de descarga: el de la subida automática a Drive si existe;
-        #    si no, el del portapapeles (flujo manual WeTransfer).
-        link = c.get("link")
-        if not link:
+        # 2) Enlaces de descarga: todos los vídeos del lote con este mismo
+        #    Nº de cliente van en el mismo correo (subidas separadas, un
+        #    solo envío). Sin Nº, solo el vídeo de esta fila.
+        if orden:
+            grupo = [cc for cc in getattr(self, "_clips_entrega", [c])
+                     if (cc.get("orden") or "").strip() == orden]
+        else:
+            grupo = [c]
+        links = [cc["link"] for cc in grupo if cc.get("link")]
+        pendientes = len(grupo) - len(links)
+        if links and pendientes:
+            if not messagebox.askyesno(
+                    "Faltan vídeos por subir",
+                    f"El cliente {orden} tiene {len(grupo)} vídeo(s) en este "
+                    f"lote pero solo {len(links)} subido(s).\n\n"
+                    "¿Abrir el correo solo con los enlaces ya subidos?"):
+                estado_lbl.config(
+                    text=f"⚠ Sube los {pendientes} vídeo(s) que faltan y vuelve a pulsar",
+                    fg=COLORES["aviso"])
+                return
+        if not links:
+            # Flujo manual (WeTransfer): un único link desde el portapapeles.
             try:
                 posible = self.clipboard_get()
                 if envio_correo.parece_enlace_wetransfer(posible):
-                    link = posible.strip()
+                    links = [posible.strip()]
             except tk.TclError:
                 pass  # portapapeles vacío o no-texto
 
         # 3) Abrir el webmail (Gmail u Outlook según remitente) ya redactado
         asunto, cuerpo = envio_correo.redactar_correo(
-            c.get("idioma", "es"), "", link)
+            c.get("idioma", "es"), "", links or None)
         envio_correo.abrir_correo_redactado(email, asunto, cuerpo)
-        if link:
+        if len(links) > 1:
+            estado_lbl.config(
+                text=f"Correo abierto con los {len(links)} enlaces del cliente → revisa y envía",
+                fg=COLORES["ok"])
+        elif links:
             estado_lbl.config(text="Correo abierto con el link puesto → revisa y envía",
                               fg=COLORES["ok"])
         elif estado_lbl.cget("text") in ("", None):
