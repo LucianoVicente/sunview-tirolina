@@ -1373,25 +1373,42 @@ class App(BaseVentana):
         """
         orden = (c.get("orden") or "").strip()
         fecha = self._fecha_entrega()
-        # 1) Email del cliente (desde el Sheets, si está configurado)
+        # 1) Email del cliente (desde el Sheets, si está configurado).
+        #    Si no se consigue, guardamos el MOTIVO para avisarlo de forma
+        #    bien visible (antes solo iba a una etiqueta pequeña que pasaba
+        #    desapercibida: el correo se abría sin destinatario y nadie sabía
+        #    por qué).
         email = ""
-        if orden and clientes.configurado():
+        motivo_sin_email = ""
+        if not orden:
+            motivo_sin_email = (
+                "Esta fila no tiene Nº de cliente.\n\n"
+                "Escríbelo en el campo «Nº» de la fila y vuelve a pulsar "
+                "«Abrir correo».")
+        elif not clientes.configurado():
+            motivo_sin_email = (
+                "La conexión con el Google Sheets no está configurada en este "
+                "PC, así que no puedo buscar el email.\n\n"
+                "Tendrás que escribirlo a mano en el correo.")
+        else:
             try:
                 info = clientes.buscar_cliente(orden, fecha)
                 email = info.get("email", "")
                 if not email:
-                    estado_lbl.config(
-                        text=f"⚠ ORDEN {orden} encontrado pero sin email en la hoja",
-                        fg=COLORES["aviso"])
+                    motivo_sin_email = (
+                        f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} "
+                        f"en la hoja «{info.get('hoja', '?')}», pero su casilla "
+                        "de email está vacía.\n\nComprueba el Sheets o escribe "
+                        "el email a mano.")
             except clientes.ClientesError as exc:
-                estado_lbl.config(text=f"⚠ {exc}", fg=COLORES["error"])
-        elif orden and not clientes.configurado():
+                motivo_sin_email = str(exc)
+
+        if email:
+            estado_lbl.config(text=f"✓ Email: {email}", fg=COLORES["ok"])
+        else:
             estado_lbl.config(
-                text="Sheets no configurado: escribe el email a mano en Gmail",
+                text=f"⚠ Sin email (Nº {orden or '—'}, {fecha:%d/%m/%Y})",
                 fg=COLORES["aviso"])
-        elif not orden:
-            estado_lbl.config(text="Escribe primero el Nº de cliente",
-                              fg=COLORES["aviso"])
 
         # 2) Enlaces de descarga: todos los vídeos del lote con este mismo
         #    Nº de cliente van en el mismo correo (subidas separadas, un
@@ -1421,6 +1438,14 @@ class App(BaseVentana):
                     links = [posible.strip()]
             except tk.TclError:
                 pass  # portapapeles vacío o no-texto
+
+        # Aviso BIEN visible si el Sheets está configurado pero aun así no se
+        # consiguió el email: el correo se abrirá sin destinatario y conviene
+        # que el operador sepa por qué (y lo escriba a mano). En PCs sin
+        # Sheets el flujo manual es lo normal, así que no molestamos.
+        if not email and clientes.configurado():
+            messagebox.showwarning(
+                "No pude poner el email automáticamente", motivo_sin_email)
 
         # 3) Abrir el webmail (Gmail u Outlook según remitente) ya redactado
         asunto, cuerpo = envio_correo.redactar_correo(
