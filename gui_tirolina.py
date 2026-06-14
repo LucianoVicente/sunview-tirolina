@@ -1210,10 +1210,12 @@ class App(BaseVentana):
         else:
             destino = "Google Drive" if metodo == "drive" else "Gofile"
             aviso = (f"«Subir vídeo» sube a {destino} automáticamente; "
-                     "«Abrir correo» junta TODOS los enlaces del mismo Nº de "
-                     "cliente en un solo correo (sube primero todos los suyos).")
+                     "«Abrir correo» o «WhatsApp» juntan TODOS los enlaces del "
+                     "mismo Nº de cliente en un solo envío (sube primero todos "
+                     "los suyos).")
         if not clientes.configurado():
-            aviso += " (Sheets sin configurar: el email habrá que ponerlo a mano.)"
+            aviso += (" (Sheets sin configurar: el email y el teléfono habrá que "
+                      "ponerlos a mano.)")
         tk.Label(marco, text=aviso, font=(FUENTE, 9),
                  bg=COLORES["fondo"], fg=COLORES["texto_suave"],
                  anchor="w").pack(fill="x", pady=(0, 6))
@@ -1251,6 +1253,31 @@ class App(BaseVentana):
         for c in clips:
             self._fila_entrega(interior, c)
 
+        # Rueda del ratón: el Canvas no la soporta de fábrica (a diferencia del
+        # Text del registro), así que la enganchamos a mano sobre el canvas y
+        # todas las filas ya creadas para poder desplazar la lista de entrega.
+        self._habilitar_rueda(canvas, interior)
+
+    def _habilitar_rueda(self, canvas, contenedor):
+        """Hace que la rueda del ratón desplace `canvas` cuando el puntero está
+        sobre él o sobre cualquiera de sus hijos.
+
+        Bindeamos en cada widget (no con bind_all) para no robarle la rueda al
+        registro de render ni a otros scrolls; recorrer los hijos evita el
+        problema de que pasar el ratón sobre una fila «tape» al canvas.
+        """
+        def _scroll(evento):
+            canvas.yview_scroll(int(-evento.delta / 120), "units")
+            return "break"
+
+        def _bind(widget):
+            widget.bind("<MouseWheel>", _scroll)
+            for hijo in widget.winfo_children():
+                _bind(hijo)
+
+        canvas.bind("<MouseWheel>", _scroll)
+        _bind(contenedor)
+
     def _fila_entrega(self, parent, c):
         fila = tk.Frame(parent, bg=COLORES["panel"], padx=8, pady=6)
         fila.pack(fill="x", pady=2)
@@ -1281,6 +1308,11 @@ class App(BaseVentana):
                   bg=COLORES["acento"], fg="white", relief="flat",
                   cursor="hand2", padx=10,
                   command=lambda cc=c, st=estado: self._abrir_correo_cliente(cc, st),
+                  ).pack(side="right", padx=4)
+        tk.Button(fila, text="🟢 WhatsApp", font=(FUENTE, 10),
+                  bg=COLORES["ok"], fg="white", relief="flat",
+                  cursor="hand2", padx=10,
+                  command=lambda cc=c, st=estado: self._abrir_whatsapp_cliente(cc, st),
                   ).pack(side="right", padx=4)
         tk.Button(fila, text="📤 Subir vídeo", font=(FUENTE, 10),
                   bg=COLORES["fondo"], fg=COLORES["texto"], relief="flat",
@@ -1364,55 +1396,32 @@ class App(BaseVentana):
         except (ValueError, AttributeError):
             return datetime.date.today()
 
-    def _abrir_correo_cliente(self, c, estado_lbl):
-        """Busca el email por Nº cliente y abre Gmail con sus enlaces.
+    def _info_cliente(self, orden, fecha):
+        """Busca el cliente en el Sheets. Devuelve (info|None, motivo).
 
-        Cada vídeo se sube por separado (un enlace por vídeo), pero un
-        cliente con varios vídeos recibe UN solo correo con todos sus
-        enlaces, uno por línea.
+        `info` es el dict de clientes.buscar_cliente (email, telefono…) o None
+        si no se pudo obtener; `motivo` explica el porqué (sin Nº, Sheets sin
+        configurar o el error de lectura) para avisarlo de forma visible.
         """
-        orden = (c.get("orden") or "").strip()
-        fecha = self._fecha_entrega()
-        # 1) Email del cliente (desde el Sheets, si está configurado).
-        #    Si no se consigue, guardamos el MOTIVO para avisarlo de forma
-        #    bien visible (antes solo iba a una etiqueta pequeña que pasaba
-        #    desapercibida: el correo se abría sin destinatario y nadie sabía
-        #    por qué).
-        email = ""
-        motivo_sin_email = ""
         if not orden:
-            motivo_sin_email = (
-                "Esta fila no tiene Nº de cliente.\n\n"
-                "Escríbelo en el campo «Nº» de la fila y vuelve a pulsar "
-                "«Abrir correo».")
-        elif not clientes.configurado():
-            motivo_sin_email = (
-                "La conexión con el Google Sheets no está configurada en este "
-                "PC, así que no puedo buscar el email.\n\n"
-                "Tendrás que escribirlo a mano en el correo.")
-        else:
-            try:
-                info = clientes.buscar_cliente(orden, fecha)
-                email = info.get("email", "")
-                if not email:
-                    motivo_sin_email = (
-                        f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} "
-                        f"en la hoja «{info.get('hoja', '?')}», pero su casilla "
-                        "de email está vacía.\n\nComprueba el Sheets o escribe "
-                        "el email a mano.")
-            except clientes.ClientesError as exc:
-                motivo_sin_email = str(exc)
+            return None, ("Esta fila no tiene Nº de cliente.\n\n"
+                          "Escríbelo en el campo «Nº» de la fila y vuelve a "
+                          "pulsar.")
+        if not clientes.configurado():
+            return None, ("La conexión con el Google Sheets no está configurada "
+                          "en este PC, así que no puedo buscar los datos del "
+                          "cliente.\n\nTendrás que ponerlos a mano.")
+        try:
+            return clientes.buscar_cliente(orden, fecha), ""
+        except clientes.ClientesError as exc:
+            return None, str(exc)
 
-        if email:
-            estado_lbl.config(text=f"✓ Email: {email}", fg=COLORES["ok"])
-        else:
-            estado_lbl.config(
-                text=f"⚠ Sin email (Nº {orden or '—'}, {fecha:%d/%m/%Y})",
-                fg=COLORES["aviso"])
-
-        # 2) Enlaces de descarga: todos los vídeos del lote con este mismo
-        #    Nº de cliente van en el mismo correo (subidas separadas, un
-        #    solo envío). Sin Nº, solo el vídeo de esta fila.
+    def _reunir_links(self, c, orden, estado_lbl):
+        """Junta los enlaces de TODOS los vídeos del lote con el mismo Nº de
+        cliente (subidas separadas, un único envío). Sin Nº, solo el de esta
+        fila. Devuelve la lista de links, o None si el operador cancela porque
+        faltan vídeos por subir.
+        """
         if orden:
             grupo = [cc for cc in getattr(self, "_clips_entrega", [c])
                      if (cc.get("orden") or "").strip() == orden]
@@ -1425,11 +1434,11 @@ class App(BaseVentana):
                     "Faltan vídeos por subir",
                     f"El cliente {orden} tiene {len(grupo)} vídeo(s) en este "
                     f"lote pero solo {len(links)} subido(s).\n\n"
-                    "¿Abrir el correo solo con los enlaces ya subidos?"):
+                    "¿Continuar solo con los enlaces ya subidos?"):
                 estado_lbl.config(
                     text=f"⚠ Sube los {pendientes} vídeo(s) que faltan y vuelve a pulsar",
                     fg=COLORES["aviso"])
-                return
+                return None
         if not links:
             # Flujo manual (WeTransfer): un único link desde el portapapeles.
             try:
@@ -1438,6 +1447,35 @@ class App(BaseVentana):
                     links = [posible.strip()]
             except tk.TclError:
                 pass  # portapapeles vacío o no-texto
+        return links
+
+    def _abrir_correo_cliente(self, c, estado_lbl):
+        """Busca el email por Nº cliente y abre Gmail con sus enlaces.
+
+        Cada vídeo se sube por separado (un enlace por vídeo), pero un
+        cliente con varios vídeos recibe UN solo correo con todos sus
+        enlaces, uno por línea.
+        """
+        orden = (c.get("orden") or "").strip()
+        fecha = self._fecha_entrega()
+        info, motivo = self._info_cliente(orden, fecha)
+        email = (info or {}).get("email", "")
+        if info is not None and not email:
+            motivo = (f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} en la "
+                      f"hoja «{info.get('hoja', '?')}», pero su casilla de email "
+                      "está vacía.\n\nComprueba el Sheets o escribe el email a "
+                      "mano.")
+
+        if email:
+            estado_lbl.config(text=f"✓ Email: {email}", fg=COLORES["ok"])
+        else:
+            estado_lbl.config(
+                text=f"⚠ Sin email (Nº {orden or '—'}, {fecha:%d/%m/%Y})",
+                fg=COLORES["aviso"])
+
+        links = self._reunir_links(c, orden, estado_lbl)
+        if links is None:
+            return
 
         # Aviso BIEN visible si el Sheets está configurado pero aun así no se
         # consiguió el email: el correo se abrirá sin destinatario y conviene
@@ -1445,9 +1483,9 @@ class App(BaseVentana):
         # Sheets el flujo manual es lo normal, así que no molestamos.
         if not email and clientes.configurado():
             messagebox.showwarning(
-                "No pude poner el email automáticamente", motivo_sin_email)
+                "No pude poner el email automáticamente", motivo)
 
-        # 3) Abrir el webmail (Gmail u Outlook según remitente) ya redactado
+        # Abrir el webmail (Gmail u Outlook según remitente) ya redactado.
         asunto, cuerpo = envio_correo.redactar_correo(
             c.get("idioma", "es"), "", links or None)
         envio_correo.abrir_correo_redactado(email, asunto, cuerpo)
@@ -1461,6 +1499,51 @@ class App(BaseVentana):
         elif estado_lbl.cget("text") in ("", None):
             estado_lbl.config(text="Correo abierto (pega el link y envía)",
                               fg=COLORES["acento"])
+
+    def _abrir_whatsapp_cliente(self, c, estado_lbl):
+        """Busca el teléfono por Nº cliente y abre WhatsApp Web con sus enlaces.
+
+        Mismo criterio que el correo: un cliente con varios vídeos recibe UN
+        solo mensaje con todos sus enlaces. El número sale de la columna de
+        teléfono del Sheets (debe incluir el prefijo de país).
+        """
+        orden = (c.get("orden") or "").strip()
+        fecha = self._fecha_entrega()
+        info, motivo = self._info_cliente(orden, fecha)
+        telefono = (info or {}).get("telefono", "")
+        if info is not None and not telefono:
+            motivo = (f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} en la "
+                      f"hoja «{info.get('hoja', '?')}», pero su casilla de "
+                      "teléfono está vacía.\n\nComprueba el Sheets o elige el "
+                      "contacto a mano en WhatsApp.")
+
+        links = self._reunir_links(c, orden, estado_lbl)
+        if links is None:
+            return
+
+        # Aviso visible si el Sheets está configurado pero no hay número: se
+        # abrirá WhatsApp sin destinatario para elegir el contacto a mano.
+        if not telefono and clientes.configurado():
+            messagebox.showwarning(
+                "No pude poner el número automáticamente", motivo)
+
+        # Reutilizamos la plantilla del correo como texto del mensaje (sin
+        # asunto: WhatsApp no lo tiene).
+        _asunto, cuerpo = envio_correo.redactar_correo(
+            c.get("idioma", "es"), "", links or None)
+        envio_correo.abrir_whatsapp(telefono, cuerpo)
+        if telefono and links:
+            estado_lbl.config(
+                text=f"WhatsApp abierto ({telefono}) con {len(links)} enlace(s) → revisa y envía",
+                fg=COLORES["ok"])
+        elif telefono:
+            estado_lbl.config(
+                text=f"WhatsApp abierto ({telefono}) → pega el enlace y envía",
+                fg=COLORES["acento"])
+        else:
+            estado_lbl.config(
+                text="WhatsApp abierto → elige el contacto y envía",
+                fg=COLORES["acento"])
 
     def _abrir_carpeta(self):
         hoy = CARPETA_SALIDA / datetime.date.today().strftime("%d-%m-%Y")

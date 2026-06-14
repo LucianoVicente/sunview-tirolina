@@ -415,6 +415,39 @@ def abrir_wetransfer():
     webbrowser.open(WETRANSFER_URL, new=2)
 
 
+def normalizar_telefono(numero):
+    """Deja el teléfono en formato que entiende wa.me: solo dígitos.
+
+    Quita +, espacios, guiones y paréntesis. Un '00' inicial (prefijo de
+    salida internacional) se descarta porque WhatsApp espera el número en
+    formato internacional sin signos. El número del Sheets DEBE llevar el
+    prefijo de país (ej. 34 para España) para que el chat abra bien.
+    """
+    if not numero:
+        return ""
+    digitos = "".join(ch for ch in str(numero) if ch.isdigit())
+    if digitos.startswith("00"):
+        digitos = digitos[2:]
+    return digitos
+
+
+def construir_url_whatsapp(numero, mensaje):
+    """URL de WhatsApp (wa.me) con el número y el mensaje ya escritos.
+
+    Sin número válido → abre WhatsApp sin destinatario para elegir el contacto
+    a mano. wa.me redirige a WhatsApp Web (o a la app de escritorio si está).
+    """
+    num = normalizar_telefono(numero)
+    params = {"text": mensaje or ""}
+    base = f"https://wa.me/{num}" if num else "https://wa.me/"
+    return base + "?" + urlencode(params)
+
+
+def abrir_whatsapp(numero, mensaje):
+    """Abre WhatsApp Web con el chat del cliente y el mensaje ya redactado."""
+    webbrowser.open(construir_url_whatsapp(numero, mensaje), new=2)
+
+
 def construir_url_outlook(destinatario, asunto, cuerpo):
     """URL de redacción de Outlook web (Hotmail/Outlook/Live) con campos puestos.
 

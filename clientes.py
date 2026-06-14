@@ -44,7 +44,8 @@ DIAS_PESTANA = {
 }
 
 # Índices de columna por defecto (base 0), por si falta en el config.
-COLUMNAS_DEFECTO = {"orden": 1, "videos": 2, "email": 3, "nombre": 3}
+# 'telefono' (col E) se usa para el botón de WhatsApp.
+COLUMNAS_DEFECTO = {"orden": 1, "videos": 2, "email": 3, "nombre": 3, "telefono": 4}
 
 # Nombre del mes tal y como aparece en el título de la hoja mensual
 # ("VIDEOS SUNVIEW PARK MAYO2026", "... JUNIO2026", ...).
@@ -262,7 +263,7 @@ def buscar_cliente(orden, fecha=None):
 
     `orden`: el número que grita el monitor (entero o str).
     `fecha`: datetime.date; por defecto hoy.
-    Devuelve dict {"email", "videos", "orden", "pestana", "fecha"} o lanza
+    Devuelve dict {"email", "videos", "telefono", "orden", "pestana", "fecha"} o lanza
     ClientesError con un mensaje legible si no se encuentra / no configurado.
     """
     fecha = fecha or datetime.date.today()
@@ -307,9 +308,12 @@ def buscar_cliente(orden, fecha=None):
         if val_orden == orden_str:
             email = fila[cols["email"]].strip()
             videos = fila[cols["videos"]].strip() if len(fila) > cols["videos"] else ""
+            telefono = (fila[cols["telefono"]].strip()
+                        if len(fila) > cols["telefono"] else "")
             return {
                 "email": email,
                 "videos": videos,
+                "telefono": telefono,
                 "orden": orden_str,
                 "pestana": pestana,
                 "fecha": fecha,
