@@ -310,52 +310,85 @@ def limpiar_drive_antiguos(dias=None):
 
 # Texto que se deja en el cuerpo cuando aún no tenemos el enlace; el humano lo
 # sustituye al pegar, o la GUI lo rellena leyendo el portapapeles.
-PLACEHOLDER_LINK = "👉 (pega aquí el enlace de WeTransfer)"
+PLACEHOLDER_LINK = "👉 (pega aquí el enlace de descarga)"
 
-# Plantillas por idioma. {nombre} y {link} los rellena la app.
+# Enlaces fijos de marca que van en cada mensaje (correo y WhatsApp).
+# La reseña abre directo el cuadro de valoración de Google (las 5★ las marca
+# el cliente: Google no permite precargarlas).
+RESENA_URL = ("https://search.google.com/local/writereview"
+              "?placeid=ChIJyyiD6j7vcg0RqDMcA3PjXac")
+INSTAGRAM_URL = "https://www.instagram.com/sunviewparkadventure/"
+TIKTOK_URL = "https://www.tiktok.com/@sunviewpark"
+
+# Firma común (reseña + redes + despedida). Se concatena al final del cuerpo;
+# OJO: sin llaves {}, porque luego se hace .format() sobre el cuerpo completo.
+_FIRMA_ES = (
+    "\n\n━━━━━━━━━━━━━━━\n"
+    "⭐ ¿Te lo has pasado en grande? ¡Déjanos 5 estrellitas! Te lleva 10 "
+    "segundos y a nosotros nos alegra el día:\n"
+    + RESENA_URL +
+    "\n\n📲 Síguenos para más subidón y etiquétanos en tus vídeos:\n"
+    "📸 Instagram: " + INSTAGRAM_URL + "\n"
+    "🎵 TikTok: " + TIKTOK_URL +
+    "\n\n¡Gracias por volar con nosotros! 🦅☀️\n"
+    "Equipo Sunview Park"
+)
+_FIRMA_EN = (
+    "\n\n━━━━━━━━━━━━━━━\n"
+    "⭐ Had a blast? Drop us 5 stars! It takes 10 seconds and totally makes "
+    "our day:\n"
+    + RESENA_URL +
+    "\n\n📲 Follow us for more thrills and tag us in your videos:\n"
+    "📸 Instagram: " + INSTAGRAM_URL + "\n"
+    "🎵 TikTok: " + TIKTOK_URL +
+    "\n\nThanks for flying with us! 🦅☀️\n"
+    "The Sunview Park Team"
+)
+
+# Plantillas por idioma. {link} lo rellena la app (la firma ya trae sus URLs).
 # "cuerpo_varios" se usa cuando el cliente tiene más de un vídeo: un solo
-# correo con todos sus enlaces, uno por línea.
+# mensaje con todos sus enlaces, uno por línea.
 PLANTILLAS = {
     "es": {
-        "asunto": "Tu vídeo de tirolina en Sunview Park",
+        "asunto": "🪂 ¡Tu vídeo de tirolina en Sunview Park!",
         "cuerpo": (
-            "¡Hola {nombre}!\n\n"
-            "Aquí tienes el vídeo de tu salto en la tirolina de Sunview Park.\n"
-            "Puedes descargarlo desde este enlace:\n\n"
-            "{link}\n\n"
-            "El enlace está disponible solo unos días, así que guárdalo cuanto antes.\n\n"
-            "¡Gracias por volar con nosotros!\n"
-            "Equipo Sunview Park"
+            "¡Hola, crack! 🤙\n\n"
+            "¡Menudo vuelo te has pegado! 🪂💨 Aquí tienes el vídeo de tu salto "
+            "en la tirolina de Sunview Park para revivirlo las veces que quieras "
+            "(y presumir un poco 😎).\n\n"
+            "👉 Descárgalo aquí:\n{link}\n\n"
+            "⏳ El enlace caduca en unos días, ¡guárdalo cuanto antes!"
+            + _FIRMA_ES
         ),
         "cuerpo_varios": (
-            "¡Hola {nombre}!\n\n"
-            "Aquí tienes los vídeos de tus saltos en la tirolina de Sunview Park.\n"
-            "Puedes descargarlos desde estos enlaces:\n\n"
-            "{link}\n\n"
-            "Los enlaces están disponibles solo unos días, así que guárdalos cuanto antes.\n\n"
-            "¡Gracias por volar con nosotros!\n"
-            "Equipo Sunview Park"
+            "¡Hola, crack! 🤙\n\n"
+            "¡Menudos vuelos te has pegado! 🪂💨 Aquí tienes los vídeos de tus "
+            "saltos en la tirolina de Sunview Park para revivirlos las veces que "
+            "quieras (y presumir un poco 😎).\n\n"
+            "👉 Descárgalos aquí:\n{link}\n\n"
+            "⏳ Los enlaces caducan en unos días, ¡guárdalos cuanto antes!"
+            + _FIRMA_ES
         ),
     },
     "en": {
-        "asunto": "Your zipline video at Sunview Park",
+        "asunto": "🪂 Your zipline video at Sunview Park!",
         "cuerpo": (
-            "Hi {nombre}!\n\n"
-            "Here is the video of your zipline jump at Sunview Park.\n"
-            "You can download it from this link:\n\n"
-            "{link}\n\n"
-            "The link is only available for a few days, so please save it soon.\n\n"
-            "Thanks for flying with us!\n"
-            "The Sunview Park Team"
+            "Hey there, legend! 🤙\n\n"
+            "What a ride! 🪂💨 Here's the video of your zipline jump at Sunview "
+            "Park so you can relive it as many times as you want (and show it "
+            "off a little 😎).\n\n"
+            "👉 Download it here:\n{link}\n\n"
+            "⏳ The link expires in a few days, so save it soon!"
+            + _FIRMA_EN
         ),
         "cuerpo_varios": (
-            "Hi {nombre}!\n\n"
-            "Here are the videos of your zipline jumps at Sunview Park.\n"
-            "You can download them from these links:\n\n"
-            "{link}\n\n"
-            "The links are only available for a few days, so please save them soon.\n\n"
-            "Thanks for flying with us!\n"
-            "The Sunview Park Team"
+            "Hey there, legend! 🤙\n\n"
+            "What rides! 🪂💨 Here are the videos of your zipline jumps at "
+            "Sunview Park so you can relive them as many times as you want (and "
+            "show them off a little 😎).\n\n"
+            "👉 Download them here:\n{link}\n\n"
+            "⏳ The links expire in a few days, so save them soon!"
+            + _FIRMA_EN
         ),
     },
 }
