@@ -432,10 +432,10 @@ def normalizar_telefono(numero):
 
 
 def construir_url_whatsapp(numero, mensaje):
-    """URL de WhatsApp (wa.me) con el número y el mensaje ya escritos.
+    """URL de WhatsApp Web (wa.me) con el número y el mensaje ya escritos.
 
     Sin número válido → abre WhatsApp sin destinatario para elegir el contacto
-    a mano. wa.me redirige a WhatsApp Web (o a la app de escritorio si está).
+    a mano. wa.me redirige a WhatsApp Web en el navegador.
     """
     num = normalizar_telefono(numero)
     params = {"text": mensaje or ""}
@@ -443,8 +443,34 @@ def construir_url_whatsapp(numero, mensaje):
     return base + "?" + urlencode(params)
 
 
+def construir_uri_whatsapp_app(numero, mensaje):
+    """URI 'whatsapp://' para la app de escritorio con el chat y el mensaje.
+
+    Es el esquema que registra WhatsApp Desktop al instalarse; abrirlo lanza
+    la app (no el navegador). Sin número, abre la app para elegir el contacto.
+    """
+    num = normalizar_telefono(numero)
+    if num:
+        params = {"phone": num, "text": mensaje or ""}
+    else:
+        params = {"text": mensaje or ""}
+    return "whatsapp://send?" + urlencode(params)
+
+
 def abrir_whatsapp(numero, mensaje):
-    """Abre WhatsApp Web con el chat del cliente y el mensaje ya redactado."""
+    """Abre el chat del cliente en la app de WhatsApp de escritorio.
+
+    En recepción usan la app de escritorio, así que probamos primero el
+    esquema 'whatsapp://' (lo abre ShellExecute vía os.startfile). Si la app
+    no está instalada/registrada, os.startfile lanza OSError y caemos a
+    WhatsApp Web en el navegador para no quedarnos sin enviar.
+    """
+    if sys.platform == "win32":
+        try:
+            os.startfile(construir_uri_whatsapp_app(numero, mensaje))
+            return
+        except OSError:
+            pass  # la app no está instalada: usamos la web
     webbrowser.open(construir_url_whatsapp(numero, mensaje), new=2)
 
 
