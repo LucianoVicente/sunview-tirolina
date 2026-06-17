@@ -324,10 +324,10 @@ TIKTOK_URL = "https://www.tiktok.com/@sunviewpark"
 # OJO: sin llaves {}, porque luego se hace .format() sobre el cuerpo completo.
 _FIRMA_ES = (
     "\n\n━━━━━━━━━━━━━━━\n"
-    "⭐ ¿Te lo has pasado en grande? ¡Déjanos 5 estrellitas! Te lleva 10 "
-    "segundos y a nosotros nos alegra el día:\n"
+    "⭐ ¿Te lo has pasado en grande? ¡Déjanos 5 estrellas! Es solo un "
+    "momento y nos alegras el día:\n"
     + RESENA_URL +
-    "\n\n📲 Síguenos para más subidón y etiquétanos en tus vídeos:\n"
+    "\n\n📲 Síguenos y etiquétanos en tus vídeos, ¡nos encanta verlos!\n"
     "📸 Instagram: " + INSTAGRAM_URL + "\n"
     "🎵 TikTok: " + TIKTOK_URL +
     "\n\n¡Gracias por volar con nosotros! 🦅☀️\n"
@@ -335,10 +335,10 @@ _FIRMA_ES = (
 )
 _FIRMA_EN = (
     "\n\n━━━━━━━━━━━━━━━\n"
-    "⭐ Had a blast? Drop us 5 stars! It takes 10 seconds and totally makes "
+    "⭐ Had a blast? Leave us 5 stars! It only takes a moment and makes "
     "our day:\n"
     + RESENA_URL +
-    "\n\n📲 Follow us for more thrills and tag us in your videos:\n"
+    "\n\n📲 Follow us and tag us in your videos, we love seeing them!\n"
     "📸 Instagram: " + INSTAGRAM_URL + "\n"
     "🎵 TikTok: " + TIKTOK_URL +
     "\n\nThanks for flying with us! 🦅☀️\n"
@@ -352,19 +352,17 @@ PLANTILLAS = {
     "es": {
         "asunto": "🪂 ¡Tu vídeo de tirolina en Sunview Park!",
         "cuerpo": (
-            "¡Hola, crack! 🤙\n\n"
-            "¡Menudo vuelo te has pegado! 🪂💨 Aquí tienes el vídeo de tu salto "
-            "en la tirolina de Sunview Park para revivirlo las veces que quieras "
-            "(y presumir un poco 😎).\n\n"
+            "¡Hola! 👋\n\n"
+            "Aquí tienes el vídeo de tu salto en la tirolina de Sunview Park "
+            "para que lo revivas las veces que quieras 🪂💨\n\n"
             "👉 Descárgalo aquí:\n{link}\n\n"
             "⏳ El enlace caduca en unos días, ¡guárdalo cuanto antes!"
             + _FIRMA_ES
         ),
         "cuerpo_varios": (
-            "¡Hola, crack! 🤙\n\n"
-            "¡Menudos vuelos te has pegado! 🪂💨 Aquí tienes los vídeos de tus "
-            "saltos en la tirolina de Sunview Park para revivirlos las veces que "
-            "quieras (y presumir un poco 😎).\n\n"
+            "¡Hola! 👋\n\n"
+            "Aquí tienes los vídeos de tus saltos en la tirolina de Sunview "
+            "Park para que los revivas las veces que quieras 🪂💨\n\n"
             "👉 Descárgalos aquí:\n{link}\n\n"
             "⏳ Los enlaces caducan en unos días, ¡guárdalos cuanto antes!"
             + _FIRMA_ES
@@ -373,7 +371,7 @@ PLANTILLAS = {
     "en": {
         "asunto": "🪂 Your zipline video at Sunview Park!",
         "cuerpo": (
-            "Hey there, legend! 🤙\n\n"
+            "Hi there! 👋\n\n"
             "What a ride! 🪂💨 Here's the video of your zipline jump at Sunview "
             "Park so you can relive it as many times as you want (and show it "
             "off a little 😎).\n\n"
@@ -382,7 +380,7 @@ PLANTILLAS = {
             + _FIRMA_EN
         ),
         "cuerpo_varios": (
-            "Hey there, legend! 🤙\n\n"
+            "Hi there! 👋\n\n"
             "What rides! 🪂💨 Here are the videos of your zipline jumps at "
             "Sunview Park so you can relive them as many times as you want (and "
             "show them off a little 😎).\n\n"
