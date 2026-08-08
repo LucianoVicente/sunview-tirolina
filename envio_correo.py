@@ -7,7 +7,7 @@ solo revisa el Gmail pre-redactado (ya con el link) y pulsa enviar.
 Por qué Gofile y no WeTransfer: WeTransfer eliminó la subida anónima de su
 API (el endpoint devuelve 404 y ahora exige cuenta + verificación), y
 SwissTransfer exige un captcha por subida. Gofile es el único equivalente
-con API oficial documentada y subida anónima (verificado 06/2026).
+con API oficial documentada y subida anónima (verificado 08/2026).
 
 Métodos disponibles (config_sheets.json → "entrega_metodo"):
   * "gofile" (defecto) — subida automática, sin configuración.
@@ -88,16 +88,20 @@ def metodo_entrega():
 
 
 # ─── Subida automática a Gofile ───
-GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadfile"
+# La API pide primero un servidor de almacenamiento y luego sube a ese host
+# concreto. NO se cablea aquí ningún host de subida: el endpoint genérico
+# "upload.gofile.io/uploadfile" que usábamos antes fue retirado y ahora
+# devuelve 500 (error-createFolderResponse) con ficheros pequeños y corta la
+# conexión a media subida con los vídeos grandes (WinError 10054).
+GOFILE_SERVERS_URL = "https://api.gofile.io/servers"
+_GOFILE_UPLOAD_PATH = "/contents/uploadfile"
+_ZONA_PREFERIDA = "eu"  # servidor cercano: la subida desde España va más rápida
+_MAX_SERVIDORES = 3     # si un store concreto está caído, se prueba el siguiente
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SunviewPark/1.0"
 
 
-def subir_video_gofile(archivo, progreso=None):
-    """Sube el vídeo a Gofile (anónimo, API oficial) y devuelve el enlace.
-
-    `progreso` es un callable(pct:int) opcional. La subida es streaming
-    (no carga el vídeo entero en RAM). Lanza EnvioError si algo falla.
-    """
+def _deps_subida():
+    """Importa requests + toolbelt bajo demanda (no son dependencia dura)."""
     try:
         import requests
         from requests_toolbelt.multipart.encoder import (
@@ -107,10 +111,45 @@ def subir_video_gofile(archivo, progreso=None):
             "Faltan dependencias. Instala con:\n"
             "  pip install requests requests-toolbelt"
         ) from exc
+    return requests, MultipartEncoder, MultipartEncoderMonitor
 
-    archivo = Path(archivo)
-    if not archivo.exists():
-        raise EnvioError(f"No existe el archivo: {archivo}")
+
+def _servidores_gofile():
+    """Nombres de los servidores de subida, los de la zona preferida primero.
+
+    Lanza EnvioError si la API no responde o no devuelve ninguno: sin servidor
+    no hay subida posible, y cablear uno fijo es justo lo que se rompió antes.
+    """
+    requests, _, _ = _deps_subida()
+    try:
+        r = requests.get(GOFILE_SERVERS_URL,
+                         headers={"User-Agent": _USER_AGENT}, timeout=30)
+    except requests.RequestException as exc:
+        raise EnvioError(f"No se pudo conectar con Gofile: {exc}") from exc
+    if r.status_code != 200:
+        raise EnvioError(
+            f"Gofile respondió {r.status_code} al pedir servidor: {r.text[:200]}")
+    try:
+        servidores = r.json()["data"]["servers"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise EnvioError(
+            f"Respuesta inesperada de Gofile: {r.text[:200]}") from exc
+    # Orden estable: la zona preferida delante, respetando el orden de la API.
+    servidores.sort(key=lambda s: s.get("zone") != _ZONA_PREFERIDA)
+    nombres = [s["name"] for s in servidores if s.get("name")]
+    if not nombres:
+        raise EnvioError("Gofile no devolvió ningún servidor de subida.")
+    return nombres
+
+
+def _subir_a_servidor_gofile(servidor, archivo, progreso):
+    """Un intento de subida a un servidor concreto; devuelve el enlace.
+
+    Los mensajes de EnvioError son fragmentos en minúscula: quien llama los
+    compone con el nombre del servidor.
+    """
+    requests, MultipartEncoder, MultipartEncoderMonitor = _deps_subida()
+    url = f"https://{servidor}.gofile.io{_GOFILE_UPLOAD_PATH}"
 
     with open(archivo, "rb") as f:
         encoder = MultipartEncoder(
@@ -122,24 +161,46 @@ def subir_video_gofile(archivo, progreso=None):
 
         try:
             r = requests.post(
-                GOFILE_UPLOAD_URL,
+                url,
                 data=MultipartEncoderMonitor(encoder, _monitor),
                 headers={"Content-Type": encoder.content_type,
                          "User-Agent": _USER_AGENT},
                 timeout=(30, 1800),  # vídeos grandes con subida lenta
             )
         except requests.RequestException as exc:
-            raise EnvioError(f"No se pudo conectar con Gofile: {exc}") from exc
+            raise EnvioError(f"conexión interrumpida ({exc})") from exc
 
     if r.status_code != 200:
-        raise EnvioError(f"Gofile respondió {r.status_code}: {r.text[:200]}")
+        raise EnvioError(f"respondió {r.status_code}: {r.text[:200]}")
     try:
         data = r.json()
     except ValueError as exc:
-        raise EnvioError(f"Respuesta inesperada de Gofile: {r.text[:200]}") from exc
+        raise EnvioError(f"respuesta inesperada: {r.text[:200]}") from exc
     if data.get("status") != "ok" or not data.get("data", {}).get("downloadPage"):
-        raise EnvioError(f"Gofile no devolvió enlace: {str(data)[:200]}")
+        raise EnvioError(f"no devolvió enlace: {str(data)[:200]}")
     return data["data"]["downloadPage"]
+
+
+def subir_video_gofile(archivo, progreso=None):
+    """Sube el vídeo a Gofile (anónimo, API oficial) y devuelve el enlace.
+
+    `progreso` es un callable(pct:int) opcional. La subida es streaming (no
+    carga el vídeo entero en RAM) y se reintenta en otro servidor si el
+    primero falla. Lanza EnvioError si fallan todos.
+    """
+    archivo = Path(archivo)
+    if not archivo.exists():
+        raise EnvioError(f"No existe el archivo: {archivo}")
+
+    servidores = _servidores_gofile()[:_MAX_SERVIDORES]
+    ultimo_error = ""
+    for servidor in servidores:
+        try:
+            return _subir_a_servidor_gofile(servidor, archivo, progreso)
+        except EnvioError as exc:
+            ultimo_error = f"{servidor}: {exc}"
+    raise EnvioError(f"Gofile falló en {len(servidores)} servidores. "
+                     f"Último error → {ultimo_error}")
 
 
 # ─── Subida automática a Google Drive ───
