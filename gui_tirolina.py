@@ -1339,7 +1339,10 @@ class App(BaseVentana):
         if c.get("_subiendo"):
             return
         c["_subiendo"] = True
-        estado_lbl.config(text="Subiendo… 0%", fg=COLORES["acento"])
+        # Gofile sube un vídeo cada vez: hasta que no le toque el turno no hay
+        # progreso que enseñar, así que la fila se queda "en cola".
+        estado_lbl.config(text="Subiendo… 0%" if metodo == "drive"
+                          else "⏳ En cola…", fg=COLORES["acento"])
         subir = (envio_correo.subir_video_drive if metodo == "drive"
                  else envio_correo.subir_video_gofile)
         threading.Thread(target=self._worker_subir,

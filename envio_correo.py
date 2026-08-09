@@ -29,6 +29,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlencode
@@ -87,17 +89,45 @@ def metodo_entrega():
     return m if m in ("gofile", "drive", "manual") else "gofile"
 
 
+class EnvioError(Exception):
+    """Error de subida o de configuración, con mensaje legible para la GUI."""
+
+
+class _LimiteGofile(EnvioError):
+    """Gofile respondió 429: el cupo por IP está agotado y solo cabe esperar.
+
+    Se distingue del resto de errores porque cambiar de servidor no arregla
+    nada: el límite es del equipo que sube, no del servidor que recibe.
+    """
+
+
 # ─── Subida automática a Gofile ───
 # La API pide primero un servidor de almacenamiento y luego sube a ese host
 # concreto. NO se cablea aquí ningún host de subida: el endpoint genérico
 # "upload.gofile.io/uploadfile" que usábamos antes fue retirado y ahora
 # devuelve 500 (error-createFolderResponse) con ficheros pequeños y corta la
 # conexión a media subida con los vídeos grandes (WinError 10054).
+#
+# Gofile además limita por IP el uso anónimo, y cada subida sin token crea una
+# cuenta de invitado nueva. Al lanzar los siete vídeos de golpe se agotaba el
+# cupo y la API devolvía 429 (error-rateLimit) a lo siguiente que se le pidiera
+# —el "pedir servidor" de las últimas filas—. De ahí las tres medidas de abajo:
+# un vídeo cada vez, un único token de invitado para todos, y esperar cuando
+# aun así llegue un 429.
 GOFILE_SERVERS_URL = "https://api.gofile.io/servers"
 _GOFILE_UPLOAD_PATH = "/contents/uploadfile"
 _ZONA_PREFERIDA = "eu"  # servidor cercano: la subida desde España va más rápida
 _MAX_SERVIDORES = 3     # si un store concreto está caído, se prueba el siguiente
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SunviewPark/1.0"
+
+SUBIDAS_SIMULTANEAS = 1      # las demás esperan turno en el semáforo
+_ESPERAS_429 = (10, 30, 60)  # segundos antes de cada reintento tras un 429
+_CACHE_SERVIDORES_SEG = 600  # la lista de servidores apenas cambia
+
+_semaforo_subida = threading.BoundedSemaphore(SUBIDAS_SIMULTANEAS)
+_lock_gofile = threading.Lock()  # protege el token y la caché de servidores
+_token_invitado = None           # cuenta de invitado reutilizada entre vídeos
+_cache_servidores = None         # (momento, [nombres])
 
 
 def _deps_subida():
@@ -114,18 +144,40 @@ def _deps_subida():
     return requests, MultipartEncoder, MultipartEncoderMonitor
 
 
+_MSG_429 = ("Gofile está limitando las subidas desde este equipo. "
+            "Espera unos minutos y vuelve a pulsar «Subir vídeo».")
+
+
+def _olvidar_token(token):
+    """Descarta la cuenta de invitado, si sigue siendo la que ha fallado."""
+    global _token_invitado
+    with _lock_gofile:
+        if _token_invitado == token:
+            _token_invitado = None
+
+
 def _servidores_gofile():
     """Nombres de los servidores de subida, los de la zona preferida primero.
 
-    Lanza EnvioError si la API no responde o no devuelve ninguno: sin servidor
-    no hay subida posible, y cablear uno fijo es justo lo que se rompió antes.
+    La lista se cachea unos minutos: con varios vídeos en cola no aporta nada
+    volver a preguntar lo mismo, y cada petición de más gasta cupo. Lanza
+    EnvioError si la API no responde o no devuelve ninguno: sin servidor no hay
+    subida posible, y cablear uno fijo es justo lo que se rompió antes.
     """
+    global _cache_servidores
+    with _lock_gofile:
+        if (_cache_servidores
+                and time.time() - _cache_servidores[0] < _CACHE_SERVIDORES_SEG):
+            return list(_cache_servidores[1])
+
     requests, _, _ = _deps_subida()
     try:
         r = requests.get(GOFILE_SERVERS_URL,
                          headers={"User-Agent": _USER_AGENT}, timeout=30)
     except requests.RequestException as exc:
         raise EnvioError(f"No se pudo conectar con Gofile: {exc}") from exc
+    if r.status_code == 429:
+        raise _LimiteGofile(_MSG_429)
     if r.status_code != 200:
         raise EnvioError(
             f"Gofile respondió {r.status_code} al pedir servidor: {r.text[:200]}")
@@ -139,21 +191,35 @@ def _servidores_gofile():
     nombres = [s["name"] for s in servidores if s.get("name")]
     if not nombres:
         raise EnvioError("Gofile no devolvió ningún servidor de subida.")
+    with _lock_gofile:
+        _cache_servidores = (time.time(), list(nombres))
     return nombres
 
 
 def _subir_a_servidor_gofile(servidor, archivo, progreso):
     """Un intento de subida a un servidor concreto; devuelve el enlace.
 
+    Reutiliza el token de invitado que devolvió la primera subida, para que
+    todos los vídeos vayan a la misma cuenta en vez de crear una nueva cada
+    vez (crear cuentas a ráfagas es lo que dispara el 429). Cada vídeo sigue
+    teniendo su propia carpeta y su propio enlace.
+
     Los mensajes de EnvioError son fragmentos en minúscula: quien llama los
     compone con el nombre del servidor.
     """
+    global _token_invitado
     requests, MultipartEncoder, MultipartEncoderMonitor = _deps_subida()
     url = f"https://{servidor}.gofile.io{_GOFILE_UPLOAD_PATH}"
+    with _lock_gofile:
+        token = _token_invitado
 
     with open(archivo, "rb") as f:
         encoder = MultipartEncoder(
             fields={"file": (archivo.name, f, "video/mp4")})
+        cabeceras = {"Content-Type": encoder.content_type,
+                     "User-Agent": _USER_AGENT}
+        if token:
+            cabeceras["Authorization"] = f"Bearer {token}"
 
         def _monitor(m):
             if progreso is not None and encoder.len:
@@ -163,13 +229,19 @@ def _subir_a_servidor_gofile(servidor, archivo, progreso):
             r = requests.post(
                 url,
                 data=MultipartEncoderMonitor(encoder, _monitor),
-                headers={"Content-Type": encoder.content_type,
-                         "User-Agent": _USER_AGENT},
+                headers=cabeceras,
                 timeout=(30, 1800),  # vídeos grandes con subida lenta
             )
         except requests.RequestException as exc:
             raise EnvioError(f"conexión interrumpida ({exc})") from exc
 
+    if r.status_code == 429:
+        raise _LimiteGofile(_MSG_429)
+    if r.status_code in (401, 403) and token:
+        # La cuenta de invitado ya no vale: se olvida y el siguiente intento
+        # sube de forma anónima, creando una nueva.
+        _olvidar_token(token)
+        raise EnvioError("la sesión de invitado caducó")
     if r.status_code != 200:
         raise EnvioError(f"respondió {r.status_code}: {r.text[:200]}")
     try:
@@ -178,29 +250,52 @@ def _subir_a_servidor_gofile(servidor, archivo, progreso):
         raise EnvioError(f"respuesta inesperada: {r.text[:200]}") from exc
     if data.get("status") != "ok" or not data.get("data", {}).get("downloadPage"):
         raise EnvioError(f"no devolvió enlace: {str(data)[:200]}")
+    with _lock_gofile:
+        _token_invitado = data["data"].get("guestToken") or _token_invitado
     return data["data"]["downloadPage"]
 
 
-def subir_video_gofile(archivo, progreso=None):
-    """Sube el vídeo a Gofile (anónimo, API oficial) y devuelve el enlace.
-
-    `progreso` es un callable(pct:int) opcional. La subida es streaming (no
-    carga el vídeo entero en RAM) y se reintenta en otro servidor si el
-    primero falla. Lanza EnvioError si fallan todos.
-    """
-    archivo = Path(archivo)
-    if not archivo.exists():
-        raise EnvioError(f"No existe el archivo: {archivo}")
-
+def _intento_gofile(archivo, progreso):
+    """Pide servidor y prueba a subir en los primeros de la lista."""
     servidores = _servidores_gofile()[:_MAX_SERVIDORES]
     ultimo_error = ""
     for servidor in servidores:
         try:
             return _subir_a_servidor_gofile(servidor, archivo, progreso)
+        except _LimiteGofile:
+            raise  # el cupo es por IP: cambiar de servidor no arregla nada
         except EnvioError as exc:
             ultimo_error = f"{servidor}: {exc}"
     raise EnvioError(f"Gofile falló en {len(servidores)} servidores. "
                      f"Último error → {ultimo_error}")
+
+
+def subir_video_gofile(archivo, progreso=None):
+    """Sube el vídeo a Gofile (API oficial) y devuelve el enlace de descarga.
+
+    `progreso` es un callable(pct:int) opcional, y no se llama hasta que llega
+    el turno: mientras la barra siga a la espera, el vídeo está en cola. La
+    subida es streaming (no carga el vídeo entero en RAM), se reintenta en otro
+    servidor si el primero falla y espera si Gofile limita el ritmo.
+
+    Solo sube un vídeo a la vez a propósito: en paralelo se reparten la misma
+    línea (todos lentos y ninguno listo) y agotan el cupo por IP de Gofile.
+    Lanza EnvioError si no lo consigue.
+    """
+    archivo = Path(archivo)
+    if not archivo.exists():
+        raise EnvioError(f"No existe el archivo: {archivo}")
+
+    with _semaforo_subida:  # los demás vídeos esperan aquí su turno
+        limite = None
+        for espera in (0,) + _ESPERAS_429:
+            if espera:
+                time.sleep(espera)
+            try:
+                return _intento_gofile(archivo, progreso)
+            except _LimiteGofile as exc:
+                limite = exc  # esperar y reintentar es lo único que ayuda
+        raise limite
 
 
 # ─── Subida automática a Google Drive ───
@@ -211,10 +306,6 @@ def subir_video_gofile(archivo, progreso=None):
 # plantilla del correo avisa de que "el enlace está disponible solo unos
 # días", así que ambos deben ser coherentes. Override: "drive_retencion_dias".
 RETENCION_DIAS_DEFECTO = 7
-
-
-class EnvioError(Exception):
-    """Error de subida/configuración de Drive, con mensaje legible para la GUI."""
 
 
 def drive_configurado():
