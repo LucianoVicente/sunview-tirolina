@@ -74,6 +74,7 @@ from editar_tirolina import (
 )
 import envio_correo
 import clientes
+import sesion
 
 COLORES = {
     "fondo":        "#F5F7FA",
@@ -127,9 +128,18 @@ class App(BaseVentana):
         # Cache de referencias a PhotoImage (sin esto Tk las garbage-collecta)
         self._photos: dict = {}
 
+        # True mientras se reconstruye una sesión recuperada: evita que los
+        # refrescos de la UI reescriban el archivo a medio restaurar.
+        self._restaurando = False
+        # id(clip) -> Label de estado de su fila de entrega, para poder
+        # repintar "ya subido" al recuperar una sesión.
+        self._estados_entrega = {}
+
         self._construir_ui_inicio()
         self._poll_cola()
         self._bind_atajos()
+        # Último paso del arranque: si quedó trabajo sin terminar, ofrecerlo.
+        self.after(120, self._ofrecer_recuperacion)
 
     # ─────────────────────────────────────────────────────────────────────
     # PRECARGA MODELO
@@ -227,6 +237,8 @@ class App(BaseVentana):
             self._set_videos(videos)
 
     def _set_videos(self, videos: list[Path]):
+        # Nota: el guardado real se hace en _iniciar_analisis; aquí todavía
+        # no hay nada costoso que perder.
         # dict.fromkeys deduplica conservando el orden: el mismo archivo
         # arrastrado dos veces se analizaría y renderizaría duplicado.
         videos = list(dict.fromkeys(videos))
@@ -246,6 +258,7 @@ class App(BaseVentana):
             return
         try:
             self.fase = "analizando"
+            self._guardar_sesion()
             self._construir_ui_analizando()
             threading.Thread(target=self._worker_analizar_safe,
                              args=(self.videos,), daemon=True).start()
@@ -473,6 +486,7 @@ class App(BaseVentana):
             self._mostrar_ui_sin_clips_validos(clips)
             return
         self.fase = "revision"
+        self._guardar_sesion()
         self._construir_ui_revision()
         # Seleccionar el primer clip válido
         for i, c in enumerate(clips):
@@ -622,6 +636,8 @@ class App(BaseVentana):
         )
 
     def _seleccionar_clip(self, idx):
+        # (self.clip_sel se guarda con la sesión: al recuperar se vuelve al
+        # mismo clip que estaba en pantalla)
         if not (0 <= idx < len(self.clips)):
             return
         self.clip_sel = idx
@@ -883,6 +899,7 @@ class App(BaseVentana):
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
         self._refrescar_storyboard(c, c["t0"])
+        self._guardar_sesion_tras_editar()
 
     def _ajustar_t1(self, delta):
         c = self._clip_actual()
@@ -892,6 +909,7 @@ class App(BaseVentana):
         self.var_t1.set(segundos_a_mmss(c["t1"]))
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
+        self._guardar_sesion_tras_editar()
 
     def _aplicar_tiempos(self):
         """Lee los Entry y actualiza el clip."""
@@ -912,6 +930,7 @@ class App(BaseVentana):
         self._actualizar_marcadores_waveform(c)
         self._actualizar_duracion_label(c)
         self._refrescar_storyboard(c, c["t0"])
+        self._guardar_sesion_tras_editar()
 
     def _sync_entries_silencioso(self):
         """Vuelca los Entry de Inicio/Fin del clip mostrado al modelo, sin
@@ -934,11 +953,13 @@ class App(BaseVentana):
         c = self._clip_actual()
         if c is not None and hasattr(self, "var_orden"):
             c["orden"] = self.var_orden.get().strip()
+            self._guardar_sesion_tras_editar()
 
     def _guardar_idioma(self):
         c = self._clip_actual()
         if c is not None and hasattr(self, "var_idioma"):
             c["idioma"] = self.var_idioma.get()
+            self._guardar_sesion_tras_editar()
 
     def _refrescar_storyboard(self, c: dict, t_centro: float):
         """Actualiza las 3 miniaturas (t-2, t, t+2) desde la rejilla pre-extraída.
@@ -981,6 +1002,7 @@ class App(BaseVentana):
         self._refrescar_contador()
         # Refrescar botón de aprobación
         self._mostrar_detalle(c)
+        self._guardar_sesion_tras_editar()
 
     def _reproducir_audio(self):
         """Espacio → reproduce 6 s del audio centrado en t0."""
@@ -1168,6 +1190,8 @@ class App(BaseVentana):
                 self._append_log(f"  · {c['video_path'].name}: {c['render_error']}\n",
                                   "error")
         renderizados = [c for c in aprobados if c.get("rendered")]
+        self.fase = "fin"
+        self._guardar_sesion()
 
         # El render terminó: encoger su registro para dejar sitio al panel
         # de entrega (el detalle sigue ahí, con scroll).
@@ -1249,6 +1273,7 @@ class App(BaseVentana):
         sb.pack(side="right", fill="y")
 
         self._entrega_vars = {}  # id(clip) -> StringVar del Nº cliente
+        self._estados_entrega = {}   # id(clip) -> Label de estado de su fila
         self._clips_entrega = clips  # para agrupar links por Nº de cliente
         for c in clips:
             self._fila_entrega(interior, c)
@@ -1290,7 +1315,8 @@ class App(BaseVentana):
                  bg=COLORES["panel"], fg=COLORES["texto"]).pack(side="left",
                                                                 padx=(8, 2))
         var = tk.StringVar(value=c.get("orden", ""))
-        var.trace_add("write", lambda *_a, cc=c, v=var: cc.update(orden=v.get().strip()))
+        var.trace_add("write",
+                      lambda *_a, cc=c, v=var: self._orden_entrega_editado(cc, v))
         self._entrega_vars[id(c)] = var
         tk.Entry(fila, textvariable=var, width=5, font=(FUENTE, 11),
                  justify="center").pack(side="left", padx=2)
@@ -1303,6 +1329,7 @@ class App(BaseVentana):
         estado = tk.Label(fila, text="", font=(FUENTE, 9),
                           bg=COLORES["panel"], fg=COLORES["texto_suave"])
         estado.pack(side="right", padx=(6, 0))
+        self._estados_entrega[id(c)] = estado
 
         tk.Button(fila, text="✉️ Abrir correo", font=(FUENTE, 10),
                   bg=COLORES["acento"], fg="white", relief="flat",
@@ -1319,6 +1346,11 @@ class App(BaseVentana):
                   cursor="hand2", padx=10,
                   command=lambda cc=c, st=estado: self._subir_video(cc, st),
                   ).pack(side="right", padx=4)
+
+    def _orden_entrega_editado(self, c, var):
+        """El operador cambia el Nº de cliente en una fila de entrega."""
+        c["orden"] = var.get().strip()
+        self._guardar_sesion_tras_editar()
 
     def _subir_video(self, c, estado_lbl):
         """Sube el vídeo en segundo plano y guarda el enlace de descarga.
@@ -1339,8 +1371,8 @@ class App(BaseVentana):
         if c.get("_subiendo"):
             return
         c["_subiendo"] = True
-        # Gofile sube un vídeo cada vez: hasta que no le toque el turno no hay
-        # progreso que enseñar, así que la fila se queda "en cola".
+        # Gofile sube unos pocos vídeos a la vez: hasta que no le toque el
+        # turno no hay progreso que enseñar, así que la fila se queda "en cola".
         estado_lbl.config(text="Subiendo… 0%" if metodo == "drive"
                           else "⏳ En cola…", fg=COLORES["acento"])
         subir = (envio_correo.subir_video_drive if metodo == "drive"
@@ -1387,6 +1419,9 @@ class App(BaseVentana):
             estado_lbl,
             "✓ Subido — link copiado, pulsa «Abrir correo»",
             COLORES["ok"])
+        # El enlace es lo más caro de recuperar (subir de nuevo 150 MB con la
+        # conexión de la tirolina): a disco en cuanto se tiene.
+        self._guardar_sesion()
 
     def _fecha_entrega(self):
         """Lee la fecha del panel de entrega (dd/mm/aaaa); si falla, hoy."""
@@ -1452,16 +1487,68 @@ class App(BaseVentana):
                 pass  # portapapeles vacío o no-texto
         return links
 
+    @staticmethod
+    def _fila_sigue_viva(estado_lbl):
+        """True si la fila de entrega sigue en pantalla.
+
+        La búsqueda en el Sheets tarda: para cuando responde, el operador
+        puede haber pulsado «Procesar más vídeos» y esa fila ya no existe.
+        Sin esta comprobación, el resultado tardío intentaba escribir en un
+        widget destruido y rompía el bucle de la cola.
+        """
+        try:
+            return bool(estado_lbl.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _buscar_contacto_async(self, orden, fecha, estado_lbl, continuar):
+        """Busca al cliente en el Sheets SIN bloquear la ventana.
+
+        Leer el Google Sheets son varias idas y vueltas de red. Hacerlo en el
+        hilo de Tk dejaba la app congelada ("No responde") en cuanto la
+        conexión de la tirolina se cortaba a media lectura: había que matarla
+        y se perdía todo el lote. Aquí la consulta va en un hilo aparte y el
+        resultado vuelve por la cola, que ya se procesa en el hilo principal.
+        """
+        if not orden or not clientes.configurado():
+            # Sin Nº o sin Sheets no hay red que esperar: seguimos en el acto.
+            info, motivo = self._info_cliente(orden, fecha)
+            continuar(info, motivo)
+            return
+
+        estado_lbl.config(text="⏳ Buscando datos del cliente…",
+                          fg=COLORES["acento"])
+
+        def worker():
+            info, motivo = self._info_cliente(orden, fecha)
+            self.cola.put(("contacto", (continuar, info, motivo)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _abrir_correo_cliente(self, c, estado_lbl):
         """Busca el email por Nº cliente y abre Gmail con sus enlaces.
 
         Cada vídeo se sube por separado (un enlace por vídeo), pero un
         cliente con varios vídeos recibe UN solo correo con todos sus
-        enlaces, uno por línea.
+        enlaces, uno por línea. La búsqueda del email va en segundo plano
+        (ver _buscar_contacto_async).
         """
+        if c.get("_buscando"):
+            return  # ya hay una búsqueda en marcha para esta fila
+        c["_buscando"] = True
         orden = (c.get("orden") or "").strip()
         fecha = self._fecha_entrega()
-        info, motivo = self._info_cliente(orden, fecha)
+
+        def continuar(info, motivo):
+            c["_buscando"] = False
+            self._continuar_correo(c, estado_lbl, orden, fecha, info, motivo)
+
+        self._buscar_contacto_async(orden, fecha, estado_lbl, continuar)
+
+    def _continuar_correo(self, c, estado_lbl, orden, fecha, info, motivo):
+        """Segunda mitad de «Abrir correo», ya con los datos del Sheets."""
+        if not self._fila_sigue_viva(estado_lbl):
+            return
         email = (info or {}).get("email", "")
         if info is not None and not email:
             motivo = (f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} en la "
@@ -1508,11 +1595,25 @@ class App(BaseVentana):
 
         Mismo criterio que el correo: un cliente con varios vídeos recibe UN
         solo mensaje con todos sus enlaces. El número sale de la columna de
-        teléfono del Sheets (debe incluir el prefijo de país).
+        teléfono del Sheets (debe incluir el prefijo de país). La búsqueda va
+        en segundo plano (ver _buscar_contacto_async).
         """
+        if c.get("_buscando"):
+            return
+        c["_buscando"] = True
         orden = (c.get("orden") or "").strip()
         fecha = self._fecha_entrega()
-        info, motivo = self._info_cliente(orden, fecha)
+
+        def continuar(info, motivo):
+            c["_buscando"] = False
+            self._continuar_whatsapp(c, estado_lbl, orden, fecha, info, motivo)
+
+        self._buscar_contacto_async(orden, fecha, estado_lbl, continuar)
+
+    def _continuar_whatsapp(self, c, estado_lbl, orden, fecha, info, motivo):
+        """Segunda mitad de «WhatsApp», ya con los datos del Sheets."""
+        if not self._fila_sigue_viva(estado_lbl):
+            return
         telefono = (info or {}).get("telefono", "")
         if info is not None and not telefono:
             motivo = (f"Encontré al cliente Nº {orden} del {fecha:%d/%m/%Y} en la "
@@ -1556,11 +1657,181 @@ class App(BaseVentana):
             pass
 
     def _reset(self):
+        sesion.borrar()
+        self._estados_entrega = {}
         self.videos = []
         self.clips = []
         self.clip_sel = -1
         self.fase = "inicio"
         self._construir_ui_inicio()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Sesión: guardar el trabajo para poder recuperarlo tras un cierre
+    # ─────────────────────────────────────────────────────────────────────
+    def _guardar_sesion(self):
+        """Vuelca el estado actual a disco. Se llama tras cada paso importante.
+
+        Barato (un JSON pequeño) y a prueba de fallos: si no puede guardar, la
+        app sigue igual. Ver sesion.py para el formato y el porqué.
+        """
+        if getattr(self, "_restaurando", False):
+            return  # no reescribir mientras montamos la pantalla recuperada
+        fecha = ""
+        if hasattr(self, "var_fecha_entrega"):
+            try:
+                fecha = self.var_fecha_entrega.get().strip()
+            except tk.TclError:
+                fecha = ""
+        sesion.guardar(self.fase, self.videos, self.clips,
+                       self.clip_sel, fecha, self.tmp_dir)
+
+    def _guardar_sesion_tras_editar(self, retardo_ms=1200):
+        """Guarda, pero agrupando ráfagas de ediciones en una sola escritura.
+
+        El Nº de cliente y los tiempos se editan tecleando: sin este retardo
+        se escribiría el JSON en cada pulsación. Cada llamada nueva cancela
+        la anterior, así que solo se guarda cuando el operador deja de
+        escribir.
+        """
+        pendiente = getattr(self, "_guardado_pendiente", None)
+        if pendiente is not None:
+            try:
+                self.after_cancel(pendiente)
+            except (tk.TclError, ValueError):
+                pass
+        self._guardado_pendiente = self.after(retardo_ms, self._guardar_ya)
+
+    def _guardar_ya(self):
+        self._guardado_pendiente = None
+        self._guardar_sesion()
+
+    def _limpiar_tmp_viejo(self, estado):
+        """Borra la carpeta temporal de una sesión que ya no se va a recuperar.
+
+        Al cerrar con trabajo pendiente se conserva (dentro están el audio y
+        los frames que necesita la pantalla de revisión); cuando el operador
+        decide no recuperar, ya se puede tirar. Solo se borran carpetas con
+        nuestro prefijo, para no tocar nada ajeno por un JSON manipulado.
+        """
+        viejo = estado.get("tmp_dir")
+        if not viejo:
+            return
+        ruta = Path(viejo)
+        if ruta.name.startswith("sunview_review_") and ruta != self.tmp_dir:
+            shutil.rmtree(ruta, ignore_errors=True)
+
+    def _ofrecer_recuperacion(self):
+        """Al arrancar: si quedó trabajo sin terminar, preguntar si continuar.
+
+        Se pregunta en vez de restaurar sin más porque lo normal a primera
+        hora es empezar un lote nuevo, y recuperar sin avisar despistaría.
+        """
+        if getattr(self, "_recuperacion_ofrecida", False):
+            return
+        self._recuperacion_ofrecida = True
+        if not self.winfo_exists():
+            return  # cerraron la ventana antes de que saltara el aviso
+        estado = sesion.cargar()
+        if not estado:
+            return
+        if not messagebox.askyesno("Trabajo sin terminar",
+                                   sesion.resumen(estado), icon="question"):
+            self._limpiar_tmp_viejo(estado)
+            sesion.borrar()
+            return
+        try:
+            self._restaurar_sesion(estado)
+        except Exception:  # noqa: BLE001 — nunca dejar la app sin arrancar
+            import traceback
+            detalle = traceback.format_exc(limit=3)
+            self._restaurando = False
+            sesion.borrar()
+            self._reset()
+            messagebox.showerror(
+                "No pude recuperar el trabajo",
+                "Hubo un problema al restaurar la sesión anterior, así que "
+                "empiezo de cero.\n\nLos vídeos ya generados siguen en la "
+                "carpeta salida/.\n\nDetalle:\n" + detalle)
+
+    def _restaurar_sesion(self, estado):
+        """Reconstruye la pantalla en la que se quedó el operador."""
+        self._restaurando = True
+        try:
+            self.videos = estado.get("videos", [])
+            self.clips = estado.get("clips", [])
+            self.clip_sel = -1
+            fase = sesion.fase_a_restaurar(estado)
+
+            if fase == "revision":
+                self._entrar_revision(self.clips)
+            elif fase == "fin":
+                self._restaurar_pantalla_entrega(estado)
+            else:
+                # El análisis quedó a medias: volvemos al inicio con los vídeos
+                # ya elegidos, para que solo haya que pulsar «Analizar».
+                self.fase = "inicio"
+                self._construir_ui_inicio()
+                if self.videos:
+                    self._set_videos(self.videos)
+        finally:
+            self._restaurando = False
+
+        # Guardamos ya con la fase corregida: si vuelve a cerrarse, el archivo
+        # refleja la pantalla real y no la fase interrumpida de antes.
+        self._guardar_sesion()
+
+    def _restaurar_pantalla_entrega(self, estado):
+        """Rehace la pantalla final con el registro y el panel de entrega.
+
+        Los enlaces de Gofile ya conseguidos se conservan, que es justo lo caro
+        de repetir con la conexión de la tirolina.
+        """
+        renderizados = [c for c in self.clips if c.get("rendered")]
+        self.fase = "fin"
+        self._construir_ui_rendering(max(1, len(renderizados)))
+        self.barra["value"] = len(renderizados)
+        self.lbl_prog.config(
+            text=f"Sesión recuperada — {len(renderizados)} vídeo(s) listos para entregar")
+
+        cuando = estado.get("_guardado_dt")
+        self._append_log(
+            "Trabajo recuperado de la sesión anterior"
+            + (f" ({cuando:%d/%m/%Y %H:%M})" if cuando else "") + "\n", "header")
+        for c in renderizados:
+            tiene_enlace = bool(c.get("link"))
+            self._append_log(
+                f"  {'✓' if tiene_enlace else '·'} {c['salida'].name}"
+                + (" — enlace ya subido\n" if tiene_enlace else " — falta subir\n"),
+                "ok" if tiene_enlace else "info")
+        sin_render = [c for c in self.clips
+                      if c.get("ok") and not c.get("rendered") and not c.get("error")]
+        if sin_render:
+            self._append_log(
+                f"\n⚠ {len(sin_render)} vídeo(s) aprobados se quedaron sin generar. "
+                "Pulsa «↻ Procesar más vídeos» para rehacerlos.\n", "aviso")
+
+        self.log.config(height=5)
+        pie = tk.Frame(self, bg=COLORES["fondo"])
+        pie.pack(side="bottom", fill="x", pady=10)
+        tk.Button(pie, text="📂 Abrir carpeta salida/",
+                  font=(FUENTE, 10), bg=COLORES["acento"], fg="white",
+                  relief="flat", cursor="hand2", padx=14, pady=6,
+                  command=self._abrir_carpeta).pack(side="left", padx=16)
+        tk.Button(pie, text="↻ Procesar más vídeos",
+                  font=(FUENTE, 10), bg=COLORES["fondo"], fg=COLORES["acento"],
+                  relief="flat", cursor="hand2", padx=14, pady=6,
+                  command=self._reset).pack(side="right", padx=16)
+
+        if renderizados:
+            self._construir_panel_entrega(renderizados)
+            if estado.get("fecha_entrega") and hasattr(self, "var_fecha_entrega"):
+                self.var_fecha_entrega.set(estado["fecha_entrega"])
+            # Reflejar en cada fila el enlace que ya se había conseguido.
+            for c in renderizados:
+                lbl = self._estados_entrega.get(id(c))
+                if lbl is not None and c.get("link"):
+                    self._on_entrega_estado(
+                        lbl, "✓ Ya subido — pulsa «Abrir correo»", COLORES["ok"])
 
     # ─────────────────────────────────────────────────────────────────────
     # Atajos de teclado globales
@@ -1611,6 +1882,15 @@ class App(BaseVentana):
                     self._on_entrega_estado(*data)
                 elif tipo == "entrega_link":
                     self._on_entrega_link(*data)
+                elif tipo == "contacto":
+                    # Resultado de buscar al cliente en el Sheets: la segunda
+                    # mitad de «Abrir correo»/«WhatsApp» corre aquí, ya en el
+                    # hilo principal, que es el único que puede tocar Tk.
+                    continuar, info, motivo = data
+                    try:
+                        continuar(info, motivo)
+                    except tk.TclError:
+                        pass  # la fila desapareció mientras se buscaba
                 elif tipo == "modelo_error":
                     pass  # se logueará al iniciar análisis
         except queue.Empty:
@@ -1638,10 +1918,28 @@ class App(BaseVentana):
             winsound.PlaySound(None, winsound.SND_PURGE)
         except RuntimeError:
             pass
-        try:
-            shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        except OSError:
-            pass
+
+        # Guardar el trabajo ANTES de destruir nada: si mañana se abre la app
+        # (o si esto es un cierre a la fuerza tras un cuelgue), se podrá
+        # continuar donde se dejó.
+        pendiente = getattr(self, "_guardado_pendiente", None)
+        if pendiente is not None:
+            try:
+                self.after_cancel(pendiente)   # el guardado final lo cubre
+            except (tk.TclError, ValueError):
+                pass
+            self._guardado_pendiente = None
+        self._guardar_sesion()
+
+        # Los temporales (audio y frames del storyboard) solo se borran si no
+        # queda nada que recuperar: la pantalla de revisión los necesita.
+        hay_pendiente = any(
+            c.get("video_path") and not c.get("error") for c in self.clips)
+        if not hay_pendiente:
+            try:
+                shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            except OSError:
+                pass
         self.destroy()
 
 

@@ -59,6 +59,18 @@ MESES_NOMBRE = {
 # búsqueda dentro de la misma sesión de la GUI.
 _CACHE_HOJA_MES = {}
 
+# Cliente gspread ya autorizado, reutilizado durante toda la sesión. Sin esto
+# cada pulsación de «Abrir correo» rehacía el intercambio de token con Google
+# (una ida y vuelta de red extra por cada botón).
+_CACHE_CLIENTE = None
+
+# Tiempos máximos de espera con Google, en segundos: (conectar, leer).
+# CRÍTICO: gspread deja el socket SIN timeout por defecto. En la tirolina, con
+# la conexión inestable, una lectura cortada a medias no devolvía error nunca
+# y la app se quedaba colgada para siempre (había que matarla y perder el
+# trabajo). Con timeout, una caída de red da un error legible en segundos.
+TIMEOUT_SHEETS = (10, 20)
+
 
 class ClientesError(Exception):
     """Error de configuración o de lectura del Sheets, con mensaje para la GUI."""
@@ -109,7 +121,15 @@ def _email_robot(cfg):
 
 
 def _cliente_gspread(cfg):
-    """Crea el cliente autorizado de gspread, o lanza ClientesError claro."""
+    """Devuelve el cliente autorizado de gspread, o lanza ClientesError claro.
+
+    Se cachea durante la sesión: gspread renueva solo el token cuando
+    caduca, así que reutilizarlo ahorra una ida y vuelta de red por
+    cada búsqueda.
+    """
+    global _CACHE_CLIENTE
+    if _CACHE_CLIENTE is not None:
+        return _CACHE_CLIENTE
     try:
         import gspread
         from google.oauth2.service_account import Credentials
@@ -130,11 +150,16 @@ def _cliente_gspread(cfg):
         creds = Credentials.from_service_account_file(
             cfg["service_account_json"], scopes=scopes
         )
-        return gspread.authorize(creds)
+        cliente = gspread.authorize(creds)
     except Exception as exc:  # noqa: BLE001 — queremos mensaje único para la GUI
         raise ClientesError(
             f"No se pudo autenticar la cuenta de servicio.\nDetalle: {exc}"
         ) from exc
+
+    # Sin esto el socket espera indefinidamente cuando se corta la red.
+    cliente.set_timeout(TIMEOUT_SHEETS)
+    _CACHE_CLIENTE = cliente
+    return cliente
 
 
 def _descubrir_hoja_mes(cliente, fecha):
@@ -189,6 +214,22 @@ def _abrir_hoja(cfg, fecha=None):
             f"No se pudo abrir el Google Sheets. Revisa que el robot tenga "
             f"acceso a la hoja y que el ID sea correcto.\nDetalle: {exc}"
         ) from exc
+
+
+def _mensaje_red(exc, haciendo):
+    """Traduce un fallo de red a un aviso que el operador pueda entender.
+
+    Los timeouts son lo esperable en la tirolina (conexión por cable
+    inestable): conviene que se lean como "reintenta" y no como un error
+    del programa.
+    """
+    nombre = type(exc).__name__
+    if any(p in nombre for p in ("Timeout", "ConnectionError", "ConnectionAborted",
+                                 "ConnectionReset", "SSLError")):
+        return (f"Se cayó la conexión con Google {haciendo}.\n\n"
+                "Comprueba internet y vuelve a pulsar el botón. "
+                "El trabajo hecho no se pierde.")
+    return f"Error {haciendo} del Google Sheets.\nDetalle: {exc}"
 
 
 def _nombre_pestana(fecha):
@@ -286,7 +327,10 @@ def buscar_cliente(orden, fecha=None):
             f"Pestañas disponibles: {disponibles}"
         )
 
-    filas = ws.get_all_values()
+    try:
+        filas = ws.get_all_values()
+    except Exception as exc:  # noqa: BLE001 — red caída a mitad de lectura
+        raise ClientesError(_mensaje_red(exc, "leyendo la pestaña")) from exc
     bloque = _bloque_de_fecha(filas, fecha, cols["orden"])
     if not bloque:
         # Pista clave: cada mes se crea un Sheets nuevo. Si la fecha buscada
