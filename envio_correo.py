@@ -100,6 +100,24 @@ class _LimiteGofile(EnvioError):
     nada: el límite es del equipo que sube, no del servidor que recibe.
     """
 
+    # Reintentar es barato (falla al instante, sin subir nada) y al cupo hay
+    # que darle tiempo: se puede insistir más y esperando más.
+    ESPERAS = (10, 30, 60)
+
+
+class _CorteConexion(EnvioError):
+    """La línea se cortó con la subida ya en marcha (WinError 10053/10054).
+
+    Se distingue de "el servidor no responde" por un detalle que importa: si ya
+    se habían enviado megas, el store estaba aceptando datos y el que ha fallado
+    es el camino, no el destino. Cambiar de servidor solo malgasta otra subida
+    entera del vídeo; lo que arregla esto es esperar un poco y repetir.
+    """
+
+    # Aquí cada reintento vuelve a subir el vídeo entero: dos minutos largos
+    # por ronda. Pocas y pronto, que detrás hay más vídeos esperando turno.
+    ESPERAS = (10, 30)
+
 
 # ─── Subida automática a Gofile ───
 # La API pide primero un servidor de almacenamiento y luego sube a ese host
@@ -112,19 +130,35 @@ class _LimiteGofile(EnvioError):
 # cuenta de invitado nueva. Al lanzar los siete vídeos de golpe se agotaba el
 # cupo y la API devolvía 429 (error-rateLimit) a lo siguiente que se le pidiera
 # —el "pedir servidor" de las últimas filas—. De ahí las tres medidas de abajo:
-# un vídeo cada vez, un único token de invitado para todos, y esperar cuando
-# aun así llegue un 429.
+# un único token de invitado para todos, unas pocas subidas a la vez en vez de
+# las siete de golpe, y esperar cuando aun así llegue un 429.
+#
+# El token es lo que permite subir en paralelo sin volver al 429: con cuenta ya
+# abierta, N subidas son N POST a los stores y ninguna llamada más a la API. Lo
+# que no se puede es arrancar N a la vez SIN token, porque entonces cada una
+# abre su propia cuenta de invitado y estamos otra vez en el problema original.
+# Por eso el primer vídeo de la tanda sube solo (ver _abrir_paso).
+#
+# Y, aparte del cupo, están los cortes de línea: subir 150 MB desde la tirolina
+# tarda minutos y a veces Windows aborta la conexión a media subida (10053) o el
+# otro extremo la resetea (10054). Eso es pasajero, pero el programa lo trataba
+# como definitivo: probaba los tres servidores de un tirón (~0 s) y se rendía.
+# Por eso ahora un corte espera y repite, en vez de dar el vídeo por perdido.
 GOFILE_SERVERS_URL = "https://api.gofile.io/servers"
 _GOFILE_UPLOAD_PATH = "/contents/uploadfile"
 _ZONA_PREFERIDA = "eu"  # servidor cercano: la subida desde España va más rápida
 _MAX_SERVIDORES = 3     # si un store concreto está caído, se prueba el siguiente
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SunviewPark/1.0"
 
-SUBIDAS_SIMULTANEAS = 1      # las demás esperan turno en el semáforo
-_ESPERAS_429 = (10, 30, 60)  # segundos antes de cada reintento tras un 429
+# Tres, no más: el cupo de Gofile aguanta de sobra con token compartido, pero
+# repartir la línea entre más subidas alarga tanto cada una que se multiplica la
+# ventana de corte (10053/10054) — y cada corte re-sube el vídeo entero.
+SUBIDAS_SIMULTANEAS = 3      # las demás esperan turno en el semáforo
 _CACHE_SERVIDORES_SEG = 600  # la lista de servidores apenas cambia
+_BYTES_SUBIDA_REAL = 1024 * 1024   # a partir de aquí la subida ya iba en serio
 
 _semaforo_subida = threading.BoundedSemaphore(SUBIDAS_SIMULTANEAS)
+_lock_pionero = threading.Lock()  # solo uno abre cuenta de invitado
 _lock_gofile = threading.Lock()  # protege el token y la caché de servidores
 _token_invitado = None           # cuenta de invitado reutilizada entre vídeos
 _cache_servidores = None         # (momento, [nombres])
@@ -146,6 +180,8 @@ def _deps_subida():
 
 _MSG_429 = ("Gofile está limitando las subidas desde este equipo. "
             "Espera unos minutos y vuelve a pulsar «Subir vídeo».")
+_MSG_CORTE = ("La conexión se cortó a media subida varias veces. "
+              "Comprueba internet y vuelve a pulsar «Subir vídeo».")
 
 
 def _olvidar_token(token):
@@ -154,6 +190,13 @@ def _olvidar_token(token):
     with _lock_gofile:
         if _token_invitado == token:
             _token_invitado = None
+
+
+def _olvidar_servidores():
+    """Tira la lista cacheada: si fallaron todos, ya no representa la realidad."""
+    global _cache_servidores
+    with _lock_gofile:
+        _cache_servidores = None
 
 
 def _servidores_gofile():
@@ -225,14 +268,20 @@ def _subir_a_servidor_gofile(servidor, archivo, progreso):
             if progreso is not None and encoder.len:
                 progreso(min(100, int(m.bytes_read / encoder.len * 100)))
 
+        monitor = MultipartEncoderMonitor(encoder, _monitor)
         try:
             r = requests.post(
                 url,
-                data=MultipartEncoderMonitor(encoder, _monitor),
+                data=monitor,
                 headers=cabeceras,
                 timeout=(30, 1800),  # vídeos grandes con subida lenta
             )
         except requests.RequestException as exc:
+            if monitor.bytes_read > _BYTES_SUBIDA_REAL:
+                # Se habían enviado megas: el store iba bien y lo que cayó fue
+                # la línea. Reintentar en otro servidor es tirar otra subida
+                # entera a la basura; hay que esperar y repetir.
+                raise _CorteConexion(_MSG_CORTE) from exc
             raise EnvioError(f"conexión interrumpida ({exc})") from exc
 
     if r.status_code == 429:
@@ -255,19 +304,50 @@ def _subir_a_servidor_gofile(servidor, archivo, progreso):
     return data["data"]["downloadPage"]
 
 
-def _intento_gofile(archivo, progreso):
-    """Pide servidor y prueba a subir en los primeros de la lista."""
+def _intento_gofile(archivo, progreso, ronda=0):
+    """Pide servidor y prueba a subir en los primeros de la lista.
+
+    Cada ronda empieza por un store distinto. Si el que corta es siempre el
+    mismo (p. ej. uno al otro lado del Atlántico, que entra en la lista cuando
+    Gofile publica pocos europeos), la siguiente ronda no vuelve a tropezar.
+    """
     servidores = _servidores_gofile()[:_MAX_SERVIDORES]
+    giro = ronda % len(servidores)
+    servidores = servidores[giro:] + servidores[:giro]
     ultimo_error = ""
     for servidor in servidores:
         try:
             return _subir_a_servidor_gofile(servidor, archivo, progreso)
-        except _LimiteGofile:
-            raise  # el cupo es por IP: cambiar de servidor no arregla nada
+        except (_LimiteGofile, _CorteConexion):
+            raise  # ni el cupo ni la línea se arreglan cambiando de servidor
         except EnvioError as exc:
             ultimo_error = f"{servidor}: {exc}"
+    _olvidar_servidores()  # ninguno respondió: pedir lista nueva la próxima vez
     raise EnvioError(f"Gofile falló en {len(servidores)} servidores. "
                      f"Último error → {ultimo_error}")
+
+
+def _abrir_paso():
+    """Deja pasar a todos si ya hay cuenta de invitado; si no, a uno solo.
+
+    Sin token, cada subida abre su propia cuenta de invitado, y abrirlas a
+    ráfagas es justo lo que dispara el 429. Así que el primer vídeo de la tanda
+    sube solo y los demás esperan a que vuelva con token; a partir de ahí todos
+    comparten cuenta y pueden ir en paralelo. Solo pasa una vez por sesión, y
+    si el pionero falla el siguiente toma el relevo (también de uno en uno).
+
+    Devuelve el cerrojo que hay que soltar al terminar, o None si no había que
+    esperar a nadie.
+    """
+    with _lock_gofile:
+        if _token_invitado:
+            return None
+    _lock_pionero.acquire()      # el resto de la tanda espera aquí
+    with _lock_gofile:
+        if _token_invitado:      # el pionero ya abrió cuenta: vía libre
+            _lock_pionero.release()
+            return None
+    return _lock_pionero         # nos toca a nosotros abrirla
 
 
 def subir_video_gofile(archivo, progreso=None):
@@ -275,27 +355,46 @@ def subir_video_gofile(archivo, progreso=None):
 
     `progreso` es un callable(pct:int) opcional, y no se llama hasta que llega
     el turno: mientras la barra siga a la espera, el vídeo está en cola. La
-    subida es streaming (no carga el vídeo entero en RAM), se reintenta en otro
-    servidor si el primero falla y espera si Gofile limita el ritmo.
+    subida es streaming (no carga el vídeo entero en RAM) y se reintenta sola:
+    en otro servidor si el store no responde, y esperando un poco si Gofile
+    limita el ritmo o si la línea se corta a media subida. Cuando reintenta, la
+    barra vuelve a empezar de cero: el vídeo se sube entero otra vez.
 
-    Solo sube un vídeo a la vez a propósito: en paralelo se reparten la misma
-    línea (todos lentos y ninguno listo) y agotan el cupo por IP de Gofile.
-    Lanza EnvioError si no lo consigue.
+    Sube como mucho SUBIDAS_SIMULTANEAS vídeos a la vez, y el primero de la
+    tanda va solo para abrir la cuenta de invitado que compartirán los demás
+    (ver _abrir_paso). Lanza EnvioError si no lo consigue.
     """
     archivo = Path(archivo)
     if not archivo.exists():
         raise EnvioError(f"No existe el archivo: {archivo}")
 
     with _semaforo_subida:  # los demás vídeos esperan aquí su turno
-        limite = None
-        for espera in (0,) + _ESPERAS_429:
-            if espera:
-                time.sleep(espera)
-            try:
-                return _intento_gofile(archivo, progreso)
-            except _LimiteGofile as exc:
-                limite = exc  # esperar y reintentar es lo único que ayuda
-        raise limite
+        pionero = _abrir_paso()
+        presupuesto = {}    # esperas que le quedan a cada tipo de fallo
+        ronda = 0
+        try:
+            while True:
+                try:
+                    return _intento_gofile(archivo, progreso, ronda)
+                except (_LimiteGofile, _CorteConexion) as exc:
+                    # Cada motivo gasta su propia cuota de reintentos: son
+                    # fallos con precios muy distintos (ver ESPERAS en cada
+                    # clase).
+                    quedan = presupuesto.setdefault(
+                        type(exc), list(type(exc).ESPERAS))
+                    if not quedan:
+                        raise
+                    if progreso is not None:
+                        # La barra a cero: si se quedara en el 100% del intento
+                        # que se cortó, parecería colgada durante la espera.
+                        progreso(0)
+                    time.sleep(quedan.pop(0))
+                    ronda += 1
+        finally:
+            if pionero is not None:
+                # Con token o sin él (si hemos fallado), el siguiente pasa: o
+                # bien ya hay cuenta que compartir, o bien le toca abrirla.
+                pionero.release()
 
 
 # ─── Subida automática a Google Drive ───
