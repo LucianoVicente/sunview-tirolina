@@ -32,6 +32,19 @@ configurar una "cuenta de servicio" una vez. La hoja sigue **privada**.
 > hoja del mes por su nombre (busca el mes y el año en el título, p. ej.
 > "JUNIO" y "2026"). No hace falta tocar ninguna configuración.
 
+### Columna de país para WhatsApp
+
+Para que WhatsApp abra el chat correcto, el teléfono necesita prefijo de país.
+En vez de pedírselo al cliente, la hoja lleva una columna **Country / País**
+con un desplegable justo antes del teléfono: el cliente elige su país y
+escribe el número sin prefijo. La app los junta sola (también si el cliente
+pone el prefijo igualmente, el 0 nacional o espacios).
+
+Para añadir esa columna a un Sheets: *Extensiones → Apps Script*, pega el
+contenido de `configurar_columna_pais.gs`, guarda y ejecuta
+`configurarColumnaPais`. Si el Sheets del mes siguiente se crea copiando el
+anterior, ya la lleva. Las filas sin país se tratan como números españoles.
+
 ## Paso 3 — Crear el archivo de configuración
 
 Copia `config_sheets.example.json` a un archivo nuevo llamado

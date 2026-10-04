@@ -11,8 +11,10 @@ Estructura real de la hoja (ver memoria del proyecto):
     La fecha (col A) solo aparece en la primera fila del bloque; las de abajo
     la heredan (forward-fill).
   * El ORDEN (col B) se reinicia en cada bloque de fecha.
-  * Columnas: A=DÍA, B=ORDEN, C=VIDEOS, D=E-MAIL, E=Teléfono, F=Instagram,
-    G=Estado del vídeo.
+  * Columnas: A=DÍA, B=ORDEN, C=VIDEOS, D=E-MAIL, E=País (desplegable),
+    F=Teléfono, G=Instagram, H=Estado del vídeo. Las hojas anteriores a la
+    columna de país no la tienen (E=Teléfono): país y teléfono se localizan
+    por el texto de la cabecera, así valen los dos formatos.
 
 Búsqueda: día de la semana de hoy -> pestaña; fecha de hoy -> bloque; ORDEN -> fila.
 
@@ -29,6 +31,8 @@ import datetime
 import json
 from pathlib import Path
 
+import telefonos
+
 _BASE = Path(__file__).resolve().parent
 CONFIG_PATH = _BASE / "config_sheets.json"
 
@@ -44,7 +48,8 @@ DIAS_PESTANA = {
 }
 
 # Índices de columna por defecto (base 0), por si falta en el config.
-# 'telefono' (col E) se usa para el botón de WhatsApp.
+# 'telefono' se usa para el botón de WhatsApp. País y teléfono se buscan
+# además por cabecera (columnas_por_cabecera), que manda sobre estos índices.
 COLUMNAS_DEFECTO = {"orden": 1, "videos": 2, "email": 3, "nombre": 3, "telefono": 4}
 
 # Nombre del mes tal y como aparece en el título de la hoja mensual
@@ -299,6 +304,28 @@ def _bloque_de_fecha(filas, fecha, col_orden):
     return bloque
 
 
+def columnas_por_cabecera(cabecera):
+    """Índices de 'pais' y 'telefono' según los textos de la fila de cabecera.
+
+    Solo devuelve las columnas que encuentra; el resto sale del config.
+    """
+    encontradas = {}
+    for i, texto in enumerate(cabecera):
+        t = _normalizar(texto)
+        if "pais" not in encontradas and ("COUNTRY" in t or "PAIS" in t):
+            encontradas["pais"] = i
+        elif "telefono" not in encontradas and ("PHONE" in t or "TELEF" in t):
+            encontradas["telefono"] = i
+    return encontradas
+
+
+def _celda(fila, col):
+    """Texto de la celda `col` de la fila, o "" si no existe."""
+    if col is None or len(fila) <= col:
+        return ""
+    return fila[col].strip()
+
+
 def buscar_cliente(orden, fecha=None):
     """Busca el cliente por número de ORDEN en el bloque de la fecha dada.
 
@@ -331,6 +358,7 @@ def buscar_cliente(orden, fecha=None):
         filas = ws.get_all_values()
     except Exception as exc:  # noqa: BLE001 — red caída a mitad de lectura
         raise ClientesError(_mensaje_red(exc, "leyendo la pestaña")) from exc
+    cols = {**cols, **columnas_por_cabecera(filas[0] if filas else [])}
     bloque = _bloque_de_fecha(filas, fecha, cols["orden"])
     if not bloque:
         # Pista clave: cada mes se crea un Sheets nuevo. Si la fecha buscada
@@ -352,8 +380,11 @@ def buscar_cliente(orden, fecha=None):
         if val_orden == orden_str:
             email = fila[cols["email"]].strip()
             videos = fila[cols["videos"]].strip() if len(fila) > cols["videos"] else ""
-            telefono = (fila[cols["telefono"]].strip()
-                        if len(fila) > cols["telefono"] else "")
+            # El cliente elige país en el desplegable y escribe el número
+            # como quiere: aquí se junta en formato internacional.
+            digitos = telefonos.componer_telefono(
+                _celda(fila, cols.get("pais")), _celda(fila, cols["telefono"]))
+            telefono = f"+{digitos}" if digitos else ""
             return {
                 "email": email,
                 "videos": videos,

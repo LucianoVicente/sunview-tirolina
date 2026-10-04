@@ -9,3 +9,5 @@ google-auth>=2.0.0
 # Subida automática del vídeo (Gofile) con progreso
 requests>=2.28.0
 requests-toolbelt>=1.0.0
+# Prefijo de país del teléfono para WhatsApp (validación de números)
+phonenumbers>=8.13
